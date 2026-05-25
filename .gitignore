@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.py[cod]
+*test-results-*.json
+latest-*-test-results.json
+latest-test-results.json
+n8n-original-gardener-bot-backup.json
+n8n-workflow-created.json
+.pytest_cache/
+.venv/
