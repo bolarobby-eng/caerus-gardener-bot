@@ -203,3 +203,42 @@ Final verification against the rebuilt live Docker service:
 - `test_complex_cases.py`: 101/101 passed, run `20260602085728`.
 - `test_battle2_cases.py`: 100/100 passed, run `20260602085728`.
 - `/health` returned `{"ok":true,"service":"caerus-gardener-bot-api"}` after rebuild.
+
+## Late Ant Audit Expansion - 2026-06-02
+
+Ant's full coverage review arrived after the first gap pass and highlighted additional weaker areas around appointment lifecycle edges, messy identity/contact details, ambiguous scheduling, short/safety inputs, and provider metadata persistence.
+
+Expanded `test_gap_cases.py` from 22 to 38 scenarios covering:
+
+- Cancelling an already-cancelled appointment and then checking status.
+- Reporting the status of a staff-confirmed appointment.
+- Status requests during incomplete quote intake.
+- Starting a fresh quote after cancelling a previous appointment.
+- `+44` mobile numbers, landlines, apostrophes/hyphens in names, flat/business-style addresses, and non-DE postcode formats.
+- Time-only appointment requests such as `10am` without a day/date.
+- Past appointment windows such as `yesterday afternoon`, followed by a corrected valid slot.
+- Very short ambiguous messages such as a single emoji.
+- Compound FAQ plus intake messages covering pricing, insurance, and booking intent.
+- Unsupported-service pricing questions.
+- Fake admin/system instructions embedded inside quote text.
+- Customer requests for internals such as `redact()` and `message_events`.
+- Legal-threat/coercive language routing to staff handoff.
+- Telegram channel/provider metadata recorded in `message_events`.
+
+Issues found and fixed:
+
+- Status/cancel matching still had an overly broad confirmation/status trigger. It could treat names like `Confirmed Status` as a status request. The backend now limits deterministic status routing to explicit status phrases.
+- Business-style labelled addresses such as `The Old Forge, Main Street` were not accepted because the parser required a street number. Address extraction now accepts labelled business addresses with a recognised street word.
+- Time-only appointment windows such as `10am` could create an appointment without a day/date. Booking now requires date context before accepting a requested window.
+- Past/impossible windows such as `yesterday afternoon` could be escalated and lose the booking context. The backend now keeps the service/postcode context and asks for a valid slot.
+- Legal-threat/coercive wording such as `I'll sue you` is now routed to staff handoff instead of normal intake.
+- The Telegram metadata test harness now checks the actual conversation id used by the payload.
+
+Final verification against the rebuilt live Docker service:
+
+- `test_gap_cases.py`: 38/38 passed, run `20260602095902`.
+- `test_mvp.py`: 27/27 passed, run `20260602093339`.
+- `test_refined_cases.py`: 29/29 passed, run `20260602093534`.
+- `test_complex_cases.py`: 101/101 passed, run `20260602093752`.
+- `test_battle2_cases.py`: 100/100 passed, run `20260602094412`.
+- `/health` returned `{"ok":true,"service":"caerus-gardener-bot-api"}` after rebuild.

@@ -250,8 +250,10 @@ def extract_bare_name(text: str) -> Optional[str]:
 def extract_address_line(text: str) -> Optional[str]:
     labelled = re.search(r"\b(?:the address is|address is|address\s*:|i live at|it's at|its at|at)\s+(.+)", text, re.I | re.S)
     if labelled:
-        candidate = re.split(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b|[,\n;.!?]", labelled.group(1), maxsplit=1, flags=re.I)[0].strip()
-        if re.search(r"\d", candidate) and re.search(r"[A-Za-z]", candidate):
+        candidate = re.split(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", labelled.group(1), maxsplit=1, flags=re.I)[0]
+        candidate = candidate.strip(" ,;\n.!?")
+        has_street_word = re.search(r"\b(road|rd|street|st|avenue|ave|lane|ln|drive|close|way|court|gardens|place|main street)\b", candidate, re.I)
+        if re.search(r"[A-Za-z]", candidate) and (re.search(r"\d", candidate) or has_street_word):
             return candidate.title()
     m = re.search(r"\b(?:the address is|address is|address\s*:|i live at|it's at|its at|at)\s+([^\n,.!?;]*(?:road|rd|street|st|avenue|ave|lane|ln|drive|close|way|court|gardens|place))\b", text, re.I)
     if m:
@@ -326,6 +328,20 @@ def find_window(text: str) -> Optional[str]:
         m = re.search(pat, low)
         if m: return m.group(0)
     return None
+
+def window_has_date_context(window: Optional[str]) -> bool:
+    if not window:
+        return False
+    low = window.lower()
+    return bool(
+        re.search(r"\b(today|tomorrow|next\s+\w+|monday|tuesday|wednesday|thursday|friday|saturday|sunday|yesterday)\b", low)
+        or re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b", low)
+    )
+
+def past_or_impossible_window(window: Optional[str]) -> bool:
+    if not window:
+        return False
+    return bool(re.search(r"\byesterday\b", window.lower()))
 
 def find_weeding_dimensions(text: str) -> bool:
     low = text.lower()
@@ -467,12 +483,15 @@ def explicit_status_or_cancel(text: str) -> bool:
     return bool(
         re.search(r"^\s*(cancel|call off)\b|\b(cancel|call off)\b.{0,30}\b(appointment|booking|visit|it|that|request)\b", low)
         or re.fullmatch(r"\s*status\s*[.!?]?\s*", low)
-        or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is|confirmed?|confirmation)\b", low)
+        or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is)\b", low)
     )
 
 def explicit_human_handoff(text: str) -> bool:
     low = text.lower()
-    return bool(re.search(r"\b(speak|talk|chat)\s+to\s+(a\s+)?(human|person|someone|the team|staff)\b|\bcan\s+(a\s+)?(human|person|staff)\b|\b(human|person|staff)\s+(please|needed|deal)\b", low))
+    return bool(
+        re.search(r"\b(speak|talk|chat)\s+to\s+(a\s+)?(human|person|someone|the team|staff)\b|\bcan\s+(a\s+)?(human|person|staff)\b|\b(human|person|staff)\s+(please|needed|deal)\b", low)
+        or re.search(r"\b(i'?ll|i will|going to|gonna)\s+(sue|complain|report)\b|\b(sue|legal action|solicitor|lawyer)\b", low)
+    )
 
 def data_subject_request(text: str) -> bool:
     low = text.lower()
@@ -651,7 +670,7 @@ def hard_guard_route(message: str) -> Optional[str]:
     low = message.lower()
     if re.search(r"^\s*(cancel|call off)\b|\b(cancel|call off)\b.{0,30}\b(appointment|booking|visit|it|that|request)\b", low):
         return "cancel"
-    if re.fullmatch(r"\s*status\s*[.!?]?\s*", low) or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is|confirmed?|confirmation)\b", low):
+    if re.fullmatch(r"\s*status\s*[.!?]?\s*", low) or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is)\b", low):
         return "status"
     return None
 
@@ -949,6 +968,10 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             route = "quote"
         if re.search(r"\b(move|reschedule|change)\b.{0,40}\b(that|appointment|booking|visit|request)\b|\b(that|appointment|booking|visit|request)\b.{0,40}\b(move|reschedule|change)\b", msg.message.lower()):
             route = "booking"
+        if route == "handoff" and not explicit_human_handoff(msg.message) and explicit_booking_intent(msg.message) and service != "other":
+            route = "booking"
+        if explicit_human_handoff(msg.message):
+            route = "handoff"
         ignore_state_context = bool(state and route == "quote" and re.search(r"\b(separate quote|another quote|new quote)\b", msg.message.lower()))
         if state and route not in {"unsafe", "handoff"} and not explicit_status_or_cancel(msg.message):
             if route != "quote" and any(w in msg.message.lower() for w in ["how much", "cost", "price", "estimate"]):
@@ -1061,6 +1084,10 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                         combined_note = f"{previous['customer_notes']}\nFollow-up: {redact(msg.message)}"
             missing=[]
             missing.extend(basic_missing)
+            if window and not window_has_date_context(window):
+                window = None
+            if past_or_impossible_window(window):
+                window = None
             if outside_consultation_hours(window):
                 window = None
             if not window: missing.append("preferred date or time")
