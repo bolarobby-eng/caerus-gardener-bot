@@ -166,3 +166,40 @@ Final verification against the rebuilt live Docker service:
 - `test_complex_cases.py`: 101/101 passed, run `20260602071814`.
 - `test_battle2_cases.py`: 100/100 passed, run `20260602071814`.
 - `/health` returned `{"ok":true,"service":"caerus-gardener-bot-api"}` after rebuild.
+
+## Gap Review and Extra Coverage - 2026-06-02
+
+An additional coverage review identified gaps around channel metadata, quote-only language, rescheduling, quote cancellation/status wording, unsupported adjacent services, data-rights handoff, and appointment time-window parsing.
+
+Added `test_gap_cases.py` with 22 focused scenarios covering:
+
+- WhatsApp/phone-style sender IDs and platform `sender_name` reuse.
+- Explicit quote-only requests that mention a possible future appointment window.
+- Reschedule/move wording after an appointment request.
+- Quote cancellation and quote-status requests that must not be treated as appointment status/cancel.
+- Unsupported adjacent services: tree surgery, fence repair, pressure washing, pest control.
+- Mixed valid gardening work plus unsupported adjacent scope.
+- Customer data access/deletion requests.
+- Human handoff during pending intake.
+- Evening and Saturday boundary appointment windows.
+- Address words like `Status Road` and `Cancel Road`.
+- Postcode correction and service removal after quote intake.
+
+Issues found and fixed:
+
+- Quote-only messages such as `do not book anything yet, I only want a quote` could create a consultation appointment if a future window appeared in the same message. The backend now suppresses appointment creation for explicit quote-only intent.
+- Reschedule/move wording such as `Can we move that to Thursday afternoon?` could fall into status/handoff instead of preserving the previous appointment context. The backend now routes move/reschedule/change wording through booking context reuse.
+- Quote cancellation/status messages could be handled as appointment cancellation/status. Quote-specific cancel/status now uses the latest quote request and does not invent or alter appointments.
+- Unsupported adjacent services such as tree surgery, fence repair, pressure washing, and pest control were too vague and could loop on the service menu. They now receive a clear unsupported-scope reply without creating work.
+- Data access/deletion requests now create a staff handoff instead of being treated as normal FAQ/intake.
+- Evening windows and `next Friday at 7pm` style windows are parsed and rejected as outside consultation hours.
+- Explicit human handoff now survives pending intake state instead of being overwritten by the pending quote route.
+
+Final verification against the rebuilt live Docker service:
+
+- `test_gap_cases.py`: 22/22 passed, run `20260602085526`.
+- `test_mvp.py`: 27/27 passed, run `20260602085728`.
+- `test_refined_cases.py`: 29/29 passed, run `20260602085728`.
+- `test_complex_cases.py`: 101/101 passed, run `20260602085728`.
+- `test_battle2_cases.py`: 100/100 passed, run `20260602085728`.
+- `/health` returned `{"ok":true,"service":"caerus-gardener-bot-api"}` after rebuild.

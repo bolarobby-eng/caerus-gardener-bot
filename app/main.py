@@ -314,6 +314,7 @@ def service_label(service: str) -> str:
 def find_window(text: str) -> Optional[str]:
     low = text.lower()
     patterns = [
+        r"next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
         r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
         r"next\s+\w+(?:\s+(?:morning|afternoon|evening))?",
         r"tomorrow(?:\s+(?:morning|afternoon|evening))?",
@@ -402,7 +403,23 @@ def unsupported_services(text: str) -> list[str]:
             found.append("unsupported service")
     if re.search(r"\b(beard|hair|head|face|moustache|mustache)\b", low):
         found.append("personal grooming")
+    if re.search(r"\b(take down|fell|remove|cut down|tree surgery|tree surgeon|tall tree)\b.{0,40}\btree\b|\btree\b.{0,40}\b(take down|fell|remove|cut down|surgery|surgeon)\b", low):
+        found.append("tree surgery")
+    if re.search(r"\b(fence|fencing)\b.{0,40}\b(repair|fix|replace|install|broken)\b|\b(repair|fix|replace|install|broken)\b.{0,40}\b(fence|fencing)\b", low):
+        found.append("fence repair")
+    if re.search(r"\b(pressure wash|pressure washing|jet wash|jet washing)\b", low):
+        found.append("pressure washing")
+    if re.search(r"\b(pest control|rats?|mice|wasps?|infestation)\b", low):
+        found.append("pest control")
     return found
+
+def quote_only_intent(text: str) -> bool:
+    low = text.lower()
+    return bool(
+        re.search(r"\b(do not|don't|dont|no need to|not ready to|without)\b.{0,40}\b(book|booking|appointment|visit|come)\b", low)
+        or re.search(r"\b(only|just)\b.{0,20}\b(want|need)\b.{0,20}\bquote\b", low)
+        or re.search(r"\bquote\b.{0,30}\b(only|for now|first)\b", low)
+    )
 
 def wants_quote_summary(text: str) -> bool:
     low = text.lower()
@@ -431,7 +448,7 @@ def explicit_booking_intent(text: str) -> bool:
     low = text.lower()
     return bool(
         find_window(text)
-        or re.search(r"\b(book|booking|appointment|come|visit|schedule|available|availability)\b", low)
+        or re.search(r"\b(book|booking|appointment|come|visit|schedule|available|availability|reschedule|rebook|move|move that|change that)\b", low)
     )
 
 def explicit_quote_intent(text: str) -> bool:
@@ -455,7 +472,15 @@ def explicit_status_or_cancel(text: str) -> bool:
 
 def explicit_human_handoff(text: str) -> bool:
     low = text.lower()
-    return bool(re.search(r"\b(speak|talk|chat)\s+to\s+(a\s+)?(human|person|someone|the team|staff)\b|\b(human|person|staff)\s+(please|needed)\b", low))
+    return bool(re.search(r"\b(speak|talk|chat)\s+to\s+(a\s+)?(human|person|someone|the team|staff)\b|\bcan\s+(a\s+)?(human|person|staff)\b|\b(human|person|staff)\s+(please|needed|deal)\b", low))
+
+def data_subject_request(text: str) -> bool:
+    low = text.lower()
+    return bool(
+        re.search(r"\b(delete|remove|erase)\b.{0,40}\b(my|me|mine|personal)\b.{0,20}\b(data|details|information|record)\b", low)
+        or re.search(r"\b(copy|send|show|provide)\b.{0,40}\b(my|me|mine|personal)\b.{0,20}\b(data|details|information|record)\b", low)
+        or re.search(r"\bdata\b.{0,20}\b(you hold|held)\b.{0,20}\b(me|my|about me)\b", low)
+    )
 
 def general_opener(text: str) -> bool:
     low = text.strip().lower()
@@ -703,6 +728,8 @@ def outside_consultation_hours(window: Optional[str]) -> bool:
     low = window.lower()
     if re.search(r"\bsunday\b", low):
         return True
+    if "evening" in low:
+        return True
     m = re.search(r"\b(\d{1,2})(?::\d{2})?\s*(am|pm)\b", low)
     if not m:
         return False
@@ -864,6 +891,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
         # Normal inbound chat routing must come from the LLM planner.
         if guard_route:
             route = guard_route
+        if data_subject_request(msg.message):
+            route = "handoff"
         if is_bogus_personal_service(msg.message):
             route = "handoff"
         if route == "unsafe":
@@ -908,6 +937,9 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
         window = plan.get("preferred_window") or find_window(msg.message)
         if wants_quote_summary(msg.message):
             route = "quote"
+        if quote_only_intent(msg.message):
+            route = "quote"
+            window = None
         if (
             route == "faq"
             and service != "other"
@@ -915,8 +947,10 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             and (find_postcode(msg.message) or extract_phone(msg.message) or extract_address_line(msg.message))
         ):
             route = "quote"
+        if re.search(r"\b(move|reschedule|change)\b.{0,40}\b(that|appointment|booking|visit|request)\b|\b(that|appointment|booking|visit|request)\b.{0,40}\b(move|reschedule|change)\b", msg.message.lower()):
+            route = "booking"
         ignore_state_context = bool(state and route == "quote" and re.search(r"\b(separate quote|another quote|new quote)\b", msg.message.lower()))
-        if state and route != "unsafe" and not explicit_status_or_cancel(msg.message):
+        if state and route not in {"unsafe", "handoff"} and not explicit_status_or_cancel(msg.message):
             if route != "quote" and any(w in msg.message.lower() for w in ["how much", "cost", "price", "estimate"]):
                 route = "quote"
             elif route != "quote" and explicit_quote_intent(msg.message):
@@ -927,7 +961,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 route = state["pending_route"]
             if not ignore_state_context:
                 postcode = merge_slot(state["postcode"], postcode)
-                window = merge_slot(state["requested_window_text"], window)
+                window = window or state["requested_window_text"]
                 previous_services = state["service_type"].split("+") if state["service_type"] else []
                 if current_services and any(p in msg.message.lower() for p in ["change of plan", "actually", "instead", "rather"]):
                     previous_services = []
@@ -959,6 +993,18 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
         unsupported = unsupported_services(combined_note)
         unsupported_note = " I can’t help with " + human_join(unsupported) + ", but I can help with the gardening work." if unsupported else ""
 
+        if data_subject_request(msg.message):
+            await audit(con, msg.sender_id, "data_subject_request_handoff", True, "customer_data_rights_request", "message", provider_message_id)
+            hid = uuid.uuid4()
+            await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'data_request','normal',$3)", hid, customer_id, redact(msg.message))
+            return await respond({
+                "ok": True,
+                "route": "handoff",
+                "handoff_required": True,
+                "handoff_id": str(hid),
+                "reply": "I’ll flag this for the team to handle properly. Data access or deletion requests need a staff review before anything is shared or changed.",
+            })
+
         if is_bogus_personal_service(msg.message):
             await audit(con, msg.sender_id, "unsupported_personal_service_refused", False, "personal_grooming_with_gardening_tool", "message", provider_message_id)
             hid = uuid.uuid4()
@@ -970,6 +1016,15 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 "handoff_required": True,
                 "handoff_id": str(hid),
                 "reply": "I can’t help with personal grooming or anything unsafe like using garden equipment on a person. I can help with gardening work such as lawns, hedges, weeding, clearance, planting or garden design.",
+            })
+
+        if unsupported and service == "other":
+            await clear_state(con, customer_id, conversation_id)
+            return await respond({
+                "ok": True,
+                "route": "faq",
+                "staff_action_required": False,
+                "reply": "I can’t help with " + human_join(unsupported) + ". I can help with gardening work such as lawn mowing, hedge trimming, weeding, planting, garden clearance or garden design.",
             })
 
         if first_turn_in_conversation and not state and basic_missing and general_opener(msg.message):
@@ -998,7 +1053,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             state_job_id = state["job_id"] if state and "job_id" in state else None
             if service == "other" and explicit_booking_intent(msg.message):
                 previous = await con.fetchrow("select job_id, service_type, postcode, customer_notes from appointments where customer_id=$1 order by created_at desc limit 1", customer_id)
-                if previous and re.search(r"\b(instead|again|rebook|book|reschedule)\b", msg.message.lower()):
+                if previous and re.search(r"\b(instead|again|rebook|book|reschedule|move|change)\b", msg.message.lower()):
                     state_job_id = state_job_id or previous["job_id"]
                     service = previous["service_type"]
                     postcode = postcode or previous["postcode"]
@@ -1096,6 +1151,13 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             return await respond({"ok": True, "route": "quote", "staff_action_required": True, "job_id": str(jid), "quote_request_id": str(qid), "appointment_id": str(appointment_id) if appointment_id else None, "recommended_appointment_objective": "initial_consultation", "suggested_windows": [], "reply": f"Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"})
 
         if route in ["cancel", "status"]:
+            latest_quote_row = await latest_quote(con, customer_id)
+            if latest_quote_row and re.search(r"\bquote\b", msg.message.lower()):
+                if route == "cancel":
+                    await con.execute("update quote_requests set status='archived', updated_at=now() where id=$1", latest_quote_row["id"])
+                    await clear_state(con, customer_id, conversation_id)
+                    return await respond({"ok": True, "route": "cancel", "quote_request_id": str(latest_quote_row["id"]), "reply": "I’ve marked your quote request as cancelled for the team to review. No appointment has been changed."})
+                return await respond({"ok": True, "route": "quote_update", "quote_request_id": str(latest_quote_row["id"]), "reply": quote_summary_reply(latest_quote_row, state)})
             row = await con.fetchrow("select id,service_type,status,requested_window_text,postcode from appointments where customer_id=$1 order by created_at desc limit 1", customer_id)
             if not row:
                 return await respond({"ok": True, "route": route, "reply": "I can’t find an appointment linked to this test customer yet. Please create a booking request first or ask the team to check manually."})
