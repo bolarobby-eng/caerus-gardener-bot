@@ -1,4 +1,4 @@
-import os, re, json, uuid, hashlib
+import asyncio, os, re, json, uuid, hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
@@ -39,7 +39,11 @@ HIGH_RISK_PATTERNS = [
     r"show me all customers", r"export (the )?(database|customers)", r"run .*sql",
     r"admin password", r"api key", r"ignore (all )?(previous )?instructions",
     r"system prompt", r"another customer", r"sarah.*address", r"all customer",
+    r"all other customer", r"customer phone numbers?",
     r"list .*appointments.*phone", r"internal notes", r"pretend i am the owner",
+    r"(woman|man|person|customer)\s+before\s+me", r"previous customer",
+    r"neighbou?r.*booking", r"give me (her|his|their) address",
+    r"(her|his|their) appointment time",
 ]
 
 class TestMessage(BaseModel):
@@ -223,6 +227,8 @@ def extract_name(text: str) -> Optional[str]:
     return name.title() if name else None
 
 def extract_bare_name(text: str) -> Optional[str]:
+    if "?" in text:
+        return None
     if find_postcode(text) or extract_phone(text) or extract_address_line(text):
         return None
     cleaned = re.sub(r"[^A-Za-z' -]", "", text).strip()
@@ -232,7 +238,11 @@ def extract_bare_name(text: str) -> Optional[str]:
     if not (1 <= len(words) <= 4):
         return None
     low = cleaned.lower()
-    blocked = {"yes", "no", "thanks", "thank you", "postcode", "address", "phone", "number"}
+    blocked = {
+        "yes", "no", "thanks", "thank you", "postcode", "address", "phone", "number",
+        "hi", "hello", "hey", "hey yo", "yo", "yo yo", "hiya", "morning",
+        "good morning", "good afternoon",
+    }
     if low in blocked or any(w in low for w in ["hedge", "lawn", "garden", "weed", "quote", "book", "mow", "trim"]):
         return None
     return cleaned.title()
@@ -304,6 +314,7 @@ def service_label(service: str) -> str:
 def find_window(text: str) -> Optional[str]:
     low = text.lower()
     patterns = [
+        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b",
         r"next\s+\w+(?:\s+(?:morning|afternoon|evening))?",
         r"tomorrow(?:\s+(?:morning|afternoon|evening))?",
         r"today(?:\s+(?:morning|afternoon|evening))?",
@@ -436,7 +447,11 @@ def high_risk(text: str) -> bool:
 
 def explicit_status_or_cancel(text: str) -> bool:
     low = text.lower()
-    return any(w in low for w in ["cancel", "call off", "status", "where is", "confirm", "confirmed"])
+    return bool(
+        re.search(r"^\s*(cancel|call off)\b|\b(cancel|call off)\b.{0,30}\b(appointment|booking|visit|it|that|request)\b", low)
+        or re.fullmatch(r"\s*status\s*[.!?]?\s*", low)
+        or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is|confirmed?|confirmation)\b", low)
+    )
 
 def explicit_human_handoff(text: str) -> bool:
     low = text.lower()
@@ -445,6 +460,49 @@ def explicit_human_handoff(text: str) -> bool:
 def general_opener(text: str) -> bool:
     low = text.strip().lower()
     return bool(re.fullmatch(r"(hi|hello|hey|hey yo|yo|yo yo|hiya|morning|good morning|good afternoon)[!.?\\s]*", low))
+
+def local_conversation_plan(message: str, state: Optional[asyncpg.Record], known_postcode: Optional[str]) -> dict:
+    services = find_services(message)
+    route = "quote"
+    reply = ""
+    low = message.lower()
+    if high_risk(message):
+        route = "unsafe"
+    elif explicit_human_handoff(message):
+        route = "handoff"
+    elif explicit_status_or_cancel(message):
+        route = "status" if any(w in low for w in ["status", "where is", "confirm", "confirmed"]) else "cancel"
+    elif explicit_booking_intent(message):
+        route = "booking"
+    elif (
+        is_service_capability_question(message)
+        or ("insured" in low)
+        or "hours" in low
+        or "saturday" in low
+        or "business called" in low
+        or "business name" in low
+        or "name of your business" in low
+        or "services" in low
+        or (not services and re.search(r"\b(charge|price|cost|pricing|how much)\b", low))
+    ):
+        route = "faq"
+        reply = (
+            f"{BUSINESS_NAME} offers lawn mowing, hedge trimming, weeding, planting, garden clearance and garden design. "
+            "Hours are Mon-Fri 8am-6pm and Saturday 9am-3pm. Pricing starts from around £40/hour; chat ranges are estimates only and the team confirms the final price after review or an initial consultation. The team is fully insured."
+        )
+    elif wants_quote_summary(message):
+        route = "quote"
+    elif explicit_quote_intent(message) or services or general_opener(message) or state:
+        route = state["pending_route"] if state else "quote"
+    return {
+        "route": route,
+        "services": services,
+        "postcode": find_postcode(message) or known_postcode,
+        "preferred_window": find_window(message),
+        "customer_name": extract_name(message) or extract_bare_name(message),
+        "missing_fields": [],
+        "reply": reply,
+    }
 
 def merge_slot(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
     return incoming or existing
@@ -459,10 +517,16 @@ def human_join(items: list[str]) -> str:
 async def anthropic(system: str, user: str, max_tokens=300, model=None) -> str:
     payload = {"model": model or ANTHROPIC_MODEL_FAST, "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": user}]}
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}, json=payload)
+        for attempt in range(4):
+            r = await client.post("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}, json=payload)
+            if r.status_code != 429:
+                r.raise_for_status()
+                data = r.json()
+                return data["content"][0]["text"].strip()
+            retry_after = r.headers.get("retry-after")
+            delay = float(retry_after) if retry_after else 2 ** attempt
+            await asyncio.sleep(min(delay, 10))
         r.raise_for_status()
-        data = r.json()
-        return data["content"][0]["text"].strip()
 
 
 def extract_json_object(text: str) -> dict:
@@ -545,10 +609,13 @@ JSON schema:
         "known_postcode": known_postcode,
         "pending_state": state_obj,
     }, ensure_ascii=False, default=str)
-    out = await anthropic(system, user, max_tokens=700, model=ANTHROPIC_MODEL_FAST)
+    try:
+        out = await anthropic(system, user, max_tokens=700, model=ANTHROPIC_MODEL_FAST)
+    except httpx.HTTPStatusError:
+        return local_conversation_plan(message, state, known_postcode)
     plan = extract_json_object(out)
     if not isinstance(plan, dict):
-        return {}
+        return local_conversation_plan(message, state, known_postcode)
     return plan
 
 def hard_guard_route(message: str) -> Optional[str]:
@@ -557,9 +624,9 @@ def hard_guard_route(message: str) -> Optional[str]:
     if explicit_human_handoff(message):
         return "handoff"
     low = message.lower()
-    if re.search(r"\b(cancel|call off)\b.*\b(appointment|booking|visit|request)\b|^\s*(cancel|call off)\b", low):
+    if re.search(r"^\s*(cancel|call off)\b|\b(cancel|call off)\b.{0,30}\b(appointment|booking|visit|it|that|request)\b", low):
         return "cancel"
-    if any(w in low for w in ["status", "where is", "confirm", "confirmed"]):
+    if re.fullmatch(r"\s*status\s*[.!?]?\s*", low) or re.search(r"\b(status please|status of|what(?:'s| is) the status|where is|confirmed?|confirmation)\b", low):
         return "status"
     return None
 
@@ -784,6 +851,11 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             if bare_name:
                 await con.execute("update customers set name=$1, updated_at=now() where id=$2", bare_name, customer_id)
                 customer = await con.fetchrow("select id,sender_id,name,contact_phone from customers where id=$1", customer_id)
+        elif not state and not customer["name"]:
+            bare_name = extract_bare_name(msg.message)
+            if bare_name:
+                await con.execute("update customers set name=$1, updated_at=now() where id=$2", bare_name, customer_id)
+                customer = await con.fetchrow("select id,sender_id,name,contact_phone from customers where id=$1", customer_id)
         known_postcode = await latest_customer_postcode(con, customer_id)
         plan = await conversation_plan(msg.message, customer, state, known_postcode)
         route = (plan.get("route") or "handoff").lower()
@@ -834,6 +906,15 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             current_services = []
         service = service_key(current_services) if current_services else find_service(msg.message)
         window = plan.get("preferred_window") or find_window(msg.message)
+        if wants_quote_summary(msg.message):
+            route = "quote"
+        if (
+            route == "faq"
+            and service != "other"
+            and not is_service_capability_question(msg.message)
+            and (find_postcode(msg.message) or extract_phone(msg.message) or extract_address_line(msg.message))
+        ):
+            route = "quote"
         ignore_state_context = bool(state and route == "quote" and re.search(r"\b(separate quote|another quote|new quote)\b", msg.message.lower()))
         if state and route != "unsafe" and not explicit_status_or_cancel(msg.message):
             if route != "quote" and any(w in msg.message.lower() for w in ["how much", "cost", "price", "estimate"]):
@@ -953,6 +1034,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             existing_quote = await latest_quote(con, customer_id)
             if wants_quote_summary(msg.message) and existing_quote:
                 return await respond({"ok": True, "route": "quote_update", "staff_action_required": False, "quote_request_id": str(existing_quote["id"]), "reply": quote_summary_reply(existing_quote, state)})
+            if wants_quote_summary(msg.message):
+                return await respond({"ok": True, "route": "quote", "staff_action_required": False, "reply": "I can’t find a quote request linked to this test customer yet. Please start a quote request first or ask the team to check manually."})
             area_m2 = find_area_m2(msg.message)
             state_job_id = state["job_id"] if state and "job_id" in state else None
             if existing_quote and state_job_id and str(existing_quote["job_id"]) == str(state_job_id):
@@ -988,6 +1071,17 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             appointment_id = None
             appointment_text = ""
             if window:
+                if outside_consultation_hours(window):
+                    await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid)
+                    return await respond({
+                        "ok": True,
+                        "route": "booking",
+                        "staff_action_required": False,
+                        "job_id": str(jid),
+                        "quote_request_id": str(qid),
+                        "reply": outside_hours_reply(),
+                        "missing_fields": ["preferred date or time"],
+                    })
                 appointment_id = uuid.uuid4()
                 await con.execute("insert into appointments(id,customer_id,job_id,objective,service_type,status,requested_window_text,postcode,customer_notes,idempotency_key) values($1,$2,$3,'initial_consultation',$4,'requested',$5,$6,$7,$8) on conflict (idempotency_key) do nothing", appointment_id, customer_id, jid, service, window, postcode, combined_note, idem(msg, "quote-consultation"))
                 appointment_text = f" I’ve also requested an initial consultation for {window}; the team will confirm availability."

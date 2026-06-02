@@ -38,6 +38,46 @@ Four other failures were test expectation issues rather than product bugs:
 - Added booking context reuse for rebook/reschedule/instead messages so the bot can carry forward the previous service, postcode, notes, and job.
 - Tightened the battle-test assertions where they were checking implementation details instead of user-visible behaviour.
 
+## Sample Conversations That Required Code Fixes
+
+These are the battle-test conversations that exposed real product bugs and drove code changes, not just assertion fixes.
+
+### Service Keyword Inside Customer Name
+
+- Customer: `Garden clearance quote`
+- Bot asks for name.
+- Customer: `Clear Split`
+- Before fix: the bot kept asking for the customer's name because `Clear` overlapped with clearance/service wording.
+- Code fix: relaxed bare-name extraction so plausible human names are not rejected only because a word also appears in service keywords.
+- Verified result: the bot accepts `Clear Split`, collects the phone/address, asks for clearance waste volume, and creates a garden-clearance quote after `probably 20 bags of green waste`.
+
+### Unsupported Car Cleaning Scope
+
+- Customer details are collected first.
+- Bot asks which supported gardening service is needed.
+- Customer: `Can you clean my car?`
+- Before fix: the bot correctly avoided creating a job, but the wording said only `unsupported service`, which was too vague.
+- Code fix: improved unsupported-service labelling for car-cleaning requests.
+- Verified result: no job is created, and the reply explicitly says it cannot help with car cleaning but can help with gardening work.
+
+### Explicit Human Handoff
+
+- Customer: `I want to speak to a human about my garden`
+- Before fix: the bot treated this as an FAQ-style reply instead of a proper handoff.
+- Code fix: added explicit human/staff handoff detection and a real handoff route response.
+- Verified result: the route is `handoff`, and the bot tells the customer it will flag the conversation for the team.
+
+### Rebooking After Cancellation
+
+- Customer: `My name is Rebook, my number is 07123 610024 and the address is 94 Rebook Road DE23 8HJ. Come Monday morning for lawn 70m2`
+- Bot creates a lawn-mowing appointment request for Monday morning.
+- Customer: `cancel it`
+- Bot marks the appointment cancellation requested.
+- Customer: `Can you book Tuesday morning instead?`
+- Before fix: the bot forgot the previous lawn-mowing context and asked the customer to choose a service again.
+- Code fix: added booking context reuse for rebook/reschedule/instead messages after cancellation.
+- Verified result: the bot creates a new lawn-mowing appointment request for Tuesday morning, reusing the previous job/service context.
+
 ## Verification
 
 All tests were run against the rebuilt Docker service at `http://100.101.206.14:8788`.
