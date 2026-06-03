@@ -64,6 +64,21 @@ def conversation_events(conversation_id):
         return json.loads(r.read().decode())
 
 
+def staff_overview():
+    with urllib.request.urlopen("http://100.101.206.14:8788/v1/staff/overview", timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def latest_quote_for(sender_id):
+    quotes = staff_overview().get("quotes", [])
+    return next((q for q in quotes if q.get("sender_id") == sender_id), None)
+
+
+def quote_by_id(quote_id):
+    quotes = staff_overview().get("quotes", [])
+    return next((q for q in quotes if str(q.get("id")) == str(quote_id)), None)
+
+
 def text(obj):
     return json.dumps(obj, ensure_ascii=False).lower().replace("’", "'")
 
@@ -612,6 +627,202 @@ case(
         ok_http(rs[-1])
         and rs[-1][1].get("quote_request_id"),
         "telegram quote failed before provider metadata check",
+    ),
+)
+
+case(
+    "Garden clearance rough area and fullness is enough detail",
+    [
+        "My name is Clearance Enough, my number is 07123 900027 and the address is 40 Clearance Road DE23 8HJ. I need garden clearance.",
+        "15m2 garden and it's quite full",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[-1])
+        and rs[-1][1].get("quote_request_id")
+        and has(rs[-1][1], "garden clearance"),
+        "rough clearance area/fullness did not move forward to quote",
+    ),
+)
+
+case(
+    "Repeated vague service detail is assumed after one clarifying ask",
+    [
+        "My name is Clearance Assume, my number is 07123 900028 and the address is 41 Clearance Road DE23 8HJ. I need garden clearance.",
+        "I'm not sure",
+        "Can you come next Wednesday morning?",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and has(rs[0][1], "few bags", "skip load", "small/medium/large")
+        and ok_http(rs[1])
+        and rs[1][1].get("quote_request_id")
+        and has(rs[1][1], "ok thanks, i'll make some assumptions for now")
+        and ok_http(rs[-1])
+        and rs[-1][1].get("appointment_id")
+        and not has(rs[-1][1], "roughly how much garden waste"),
+        "bot did not ask once with examples then assume and move forward",
+    ),
+)
+
+case(
+    "Assumed lawn size is persisted for staff visibility",
+    [
+        "My name is Lawn Assume, my number is 07123 900029 and the address is 42 Lawn Road DE23 8HJ. I want a quote for lawn mowing.",
+        "No idea, sorry",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and has(rs[0][1], "small/medium/large")
+        and ok_http(rs[1])
+        and re.search(r"^ok thanks,? i'll make some assumptions for now\b", (rs[1][1].get("reply") or "").lower().replace("’", "'"))
+        and rs[1][1].get("quote_request_id")
+        and (lambda q: bool(q and "[assumed: approximate lawn size" in (q.get("description") or "").lower()))(quote_by_id(rs[1][1].get("quote_request_id"))),
+        "assumed lawn detail was not visible in quote description",
+    ),
+)
+
+case(
+    "Partial multi-service detail preserves known detail and assumes missing hedge detail",
+    [
+        "My name is Multi Assume, my number is 07123 900030 and the address is 43 Multi Road DE23 8HJ. I need lawn mowing and hedge trimming.",
+        "The lawn is 50m2 but I'm not sure about the hedges.",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and has(rs[0][1], "small/medium/large")
+        and ok_http(rs[1])
+        and rs[1][1].get("quote_request_id")
+        and re.search(r"^ok thanks,? i'll make some assumptions for now\b", (rs[1][1].get("reply") or "").lower().replace("’", "'"))
+        and (lambda q: bool(
+            q
+            and "50m2" in (q.get("description") or "").lower()
+            and "[assumed: rough hedge length/height]" in (q.get("description") or "").lower()
+            and "[assumed: approximate lawn size" not in (q.get("description") or "").lower()
+        ))(quote_by_id(rs[1][1].get("quote_request_id"))),
+        "multi-service assumption did not preserve supplied lawn size while assuming hedge detail",
+    ),
+)
+
+case(
+    "Weeding moves from where to dimensions then assumes unknown dimensions",
+    [
+        "My name is Weed Assume, my number is 07123 900031 and the address is 44 Weed Road DE23 8HJ. I need a weeding quote.",
+        "All over the garden",
+        "Sorry, I can't measure it",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and has(rs[0][1], "beds", "driveway")
+        and ok_http(rs[1])
+        and has(rs[1][1], "approximate dimensions")
+        and ok_http(rs[2])
+        and rs[2][1].get("quote_request_id")
+        and re.search(r"^ok thanks,? i'll make some assumptions for now\b", (rs[2][1].get("reply") or "").lower().replace("’", "'"))
+        and (lambda q: bool(
+            q
+            and "all over the garden" in (q.get("description") or "").lower()
+            and "[assumed: approximate weeding area dimensions]" in (q.get("description") or "").lower()
+        ))(quote_by_id(rs[2][1].get("quote_request_id"))),
+        "weeding detail flow did not move from location to dimensions then assume dimensions",
+    ),
+)
+
+case(
+    "Slow customer is not treated as assumption fallback",
+    [
+        "My name is Slow Detail, my number is 07123 900032 and the address is 45 Slow Road DE23 8HJ. I need hedge trimming.",
+        "A sec, checking",
+        "Hang on let me look",
+        "About 8m long and 2m high",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[1])
+        and not has(rs[1][1], "ok thanks, i'll make some assumptions for now")
+        and ok_http(rs[2])
+        and not has(rs[2][1], "ok thanks, i'll make some assumptions for now")
+        and ok_http(rs[3])
+        and rs[3][1].get("quote_request_id")
+        and not has(rs[3][1], "[assumed:"),
+        "slow/checking replies incorrectly triggered assumption fallback or failed to complete later",
+    ),
+)
+
+case(
+    "Negative phrasing whatever normal triggers assumption fallback",
+    [
+        "My name is Normal Guess, my number is 07123 900033 and the address is 46 Normal Road DE23 8HJ. I need garden clearance.",
+        "Whatever normal is for this kind of thing",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and ok_http(rs[1])
+        and rs[1][1].get("quote_request_id")
+        and re.search(r"^ok thanks,? i'll make some assumptions for now\b", (rs[1][1].get("reply") or "").lower().replace("’", "'")),
+        "whatever-normal phrasing did not trigger assumption fallback",
+    ),
+)
+
+case(
+    "Greeting hi there is not treated as customer name",
+    [
+        "Hi there",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[0])
+        and not has(rs[0][1], "hi hi")
+        and not has(rs[0][1], "hi there —")
+        and has(rs[0][1], "caerus gardener bot", "name"),
+        "first greeting was treated as a customer name or produced a duplicated greeting",
+    ),
+)
+
+case(
+    "Additional quote reuses existing consultation instead of requesting new appointment",
+    [
+        "My name is Existing Consult, my number is 07123 900034 and the address is 47 Consult Road DE23 8HJ. I'd like my lawn mowed.",
+        "50m2",
+        "Can we do next Monday or Tuesday?",
+        "Thanks, how much would it cost to do my hedges?",
+        "5m high and 10m wide",
+        "Can we discuss the hedges in the same appointment you've already booked?",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[2])
+        and rs[2][1].get("appointment_id")
+        and ok_http(rs[4])
+        and rs[4][1].get("quote_request_id")
+        and rs[4][1].get("appointment_id") == rs[2][1].get("appointment_id")
+        and has(rs[4][1], "already", "same consultation")
+        and not has(rs[4][1], "please share a couple of dates")
+        and ok_http(rs[5])
+        and rs[5][1].get("appointment_id") == rs[2][1].get("appointment_id")
+        and has(rs[5][1], "same consultation")
+        and not has(rs[5][1], "please share a couple of dates", "would you like us to get an initial consultation booked"),
+        "additional quote did not reuse the existing consultation cleanly",
+    ),
+)
+
+case(
+    "Weeding on lawns is treated as weeding location not lawn mowing",
+    [
+        "Morning",
+        "Freddo",
+        "07123 900035",
+        "3 Hello, DE4 5GH",
+        "3 Derby Road",
+        "Weeding",
+        "They are all over the lawns",
+        "50m2",
+    ],
+    lambda rs: passfail(
+        ok_http(rs[6])
+        and has(rs[6][1], "approximate dimensions")
+        and not has(rs[6][1], "roughly how big is the lawn")
+        and ok_http(rs[7])
+        and rs[7][1].get("quote_request_id")
+        and has(rs[7][1], "weeding")
+        and not has(rs[7][1], "lawn mowing"),
+        "weeding location on lawns was misread as lawn mowing or failed to complete after dimensions",
     ),
 )
 

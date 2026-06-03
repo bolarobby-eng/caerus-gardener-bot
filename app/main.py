@@ -15,7 +15,7 @@ ANTHROPIC_MODEL_FAST = os.getenv("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5-20251
 ANTHROPIC_MODEL_SMART = os.getenv("ANTHROPIC_MODEL_SMART", "claude-sonnet-4-5-20250929")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Caerus Gardener Bot")
 
-app = FastAPI(title="Caerus Gardener Bot API", version="0.1.0")
+app = FastAPI(title="Caerus Gardener Bot API", version="0.2.0")
 pool: asyncpg.Pool | None = None
 
 SERVICES = {
@@ -182,18 +182,44 @@ async def init_db():
       id uuid primary key,
       customer_id uuid references customers(id),
       conversation_id text not null,
+      schema_version integer not null default 2,
       pending_route text not null,
       service_type text,
       postcode text,
       requested_window_text text,
       original_message text,
       missing_fields jsonb not null default '[]'::jsonb,
+      state_json jsonb not null default '{}'::jsonb,
       job_id uuid references jobs(id),
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now(),
       unique(customer_id, conversation_id)
     );
     alter table conversation_states add column if not exists job_id uuid references jobs(id);
+    alter table conversation_states add column if not exists schema_version integer not null default 2;
+    alter table conversation_states add column if not exists state_json jsonb not null default '{}'::jsonb;
+    create table if not exists planner_events (
+      id uuid primary key,
+      customer_id uuid references customers(id),
+      conversation_id text not null,
+      provider_message_id text,
+      planner_model text,
+      state_before jsonb not null default '{}'::jsonb,
+      planner_output jsonb not null default '{}'::jsonb,
+      guardrails_applied jsonb not null default '[]'::jsonb,
+      created_at timestamptz not null default now()
+    );
+    create table if not exists tool_calls (
+      id uuid primary key,
+      customer_id uuid references customers(id),
+      conversation_id text not null,
+      provider_message_id text,
+      tool_name text not null,
+      arguments jsonb not null default '{}'::jsonb,
+      result jsonb not null default '{}'::jsonb,
+      status text not null default 'succeeded',
+      created_at timestamptz not null default now()
+    );
     """
     async with (await db()).acquire() as con:
         await con.execute(sql)
@@ -241,7 +267,7 @@ def extract_bare_name(text: str) -> Optional[str]:
     blocked = {
         "yes", "no", "thanks", "thank you", "postcode", "address", "phone", "number",
         "hi", "hello", "hey", "hey yo", "yo", "yo yo", "hiya", "morning",
-        "good morning", "good afternoon",
+        "hi there", "hello there", "hey there", "good morning", "good afternoon",
     }
     if low in blocked or any(w in low for w in ["hedge", "lawn", "garden", "weed", "quote", "book", "mow", "trim"]):
         return None
@@ -289,24 +315,50 @@ def find_service(text: str) -> str:
 
 def find_services(text: str) -> list[str]:
     low = text.lower()
+    low = re.sub(r"\bweed\s+(road|rd|street|st|avenue|ave|lane|ln|drive|close|way|court|gardens|place)\b", " ", low)
     found = []
-    for service, words in SERVICES.items():
-        if any(w in low for w in words):
+    patterns = {
+        "lawn_mowing": [r"\blawn(?:s)?\b", r"\bmow(?:ing)?\b", r"\bgrass\b"],
+        "hedge_trimming": [r"\bhedge(?:s)?\b"],
+        "weeding": [r"\bweed(?:s|ing)?\b"],
+        "garden_clearance": [r"\bclearance\b", r"\bclear\b", r"\bovergrown\b", r"\bwaste\b"],
+        "planting": [r"\bplant(?:s|ing)?\b"],
+        "garden_design": [r"\bdesign\b", r"\blandscap(?:e|ing)\b"],
+    }
+    for service, service_patterns in patterns.items():
+        if any(re.search(pattern, low) for pattern in service_patterns):
             found.append(service)
     return found
 
 def negated_services(text: str) -> list[str]:
     low = text.lower()
     negated = []
-    if re.search(r"\b(no|not|none|don't have|do not have|haven't got|have no)\b.{0,30}\bhedges?\b", low):
+    if re.search(r"\b(no|none|don't have|do not have|haven't got|have no|not got|no need for)\b.{0,30}\bhedges?\b|\bhedges?\b.{0,20}\b(no|none|don't have|do not have|haven't got|have no|not got|no need)\b", low):
         negated.append("hedge_trimming")
-    if re.search(r"\b(no|not|none|don't have|do not have|haven't got|have no)\b.{0,30}\blawns?\b", low):
+    if re.search(r"\b(no|none|don't have|do not have|haven't got|have no|not got|no need for)\b.{0,30}\blawns?\b|\blawns?\b.{0,20}\b(no|none|don't have|do not have|haven't got|have no|not got|no need)\b", low):
         negated.append("lawn_mowing")
     return negated
 
 def service_key(services: list[str]) -> str:
     services = [s for s in services if s and s != "other"]
     return "+".join(dict.fromkeys(services)) if services else "other"
+
+def weeding_location_context(state, text: str) -> bool:
+    if not state or not state["service_type"] or "weeding" not in state["service_type"]:
+        return False
+    if "where the weeding is needed" not in pending_missing(state):
+        return False
+    low = text.lower()
+    return bool(
+        re.search(r"\b(lawn|lawns|grass|turf)\b", low)
+        and not re.search(r"\b(mow|mowing|cut|lawn mowing|grass cutting)\b", low)
+    )
+
+def pending_weeding_flow(state) -> bool:
+    return bool(state and state["service_type"] and "weeding" in state["service_type"])
+
+def explicit_lawn_work(text: str) -> bool:
+    return bool(re.search(r"\b(lawn mowing|mow(?:ing)?|grass cutting|cut the grass|lawns? (?:mowed|cut|doing|done))\b", text.lower()))
 
 def service_label(service: str) -> str:
     if "+" in service:
@@ -385,25 +437,41 @@ def quote_detail_missing(service: str, text: str) -> list[str]:
     low = text.lower()
     missing = []
     services = service.split("+") if service and service != "other" else [service]
-    if "lawn_mowing" in services and not find_area_m2(text):
+    if "lawn_mowing" in services and "[assumed: approximate lawn size" in low:
+        pass
+    elif "lawn_mowing" in services and not find_area_m2(text):
         has_lawn_scale = any(w in low for w in ["small lawn", "medium lawn", "large lawn", "small garden", "medium garden", "large garden", "tiny lawn", "big lawn"])
         if not has_lawn_scale:
             missing.append("approximate lawn size, for example 100m² or small/medium/large")
-    if "hedge_trimming" in services:
+    if "hedge_trimming" in services and "[assumed: rough hedge length/height]" in low:
+        pass
+    elif "hedge_trimming" in services:
         hedge_detail = (
             re.search(r"\b\d+(?:\.\d+)?\s*(?:m|metres?|meters?|ft|feet)\b", low)
             or re.search(r"\bhedges?\D{0,20}\d+(?:\.\d+)?\s*(?:long|length|high|height)?\b", low)
         ) and any(w in low for w in ["hedge", "hedges", "high", "height", "long", "length"])
         if not hedge_detail:
             missing.append("rough hedge length/height")
-    if "garden_clearance" in services and not any(w in low for w in ["bags", "skip", "small", "medium", "large", "overgrown", "waste"]):
+    if "garden_clearance" in services and "[assumed: rough size/amount of waste]" in low:
+        pass
+    elif "garden_clearance" in services and not (
+        find_area_m2(text)
+        or any(w in low for w in ["bags", "skip", "small", "medium", "large", "overgrown", "waste", "rubbish", "full", "loads", "lots"])
+    ):
         missing.append("rough size/amount of waste")
-    if "weeding" in services:
-        has_weeding_place = any(w in low for w in ["beds", "bed", "drive", "driveway", "patio", "border", "borders", "path", "paths", "front garden", "back garden", "side garden", "vegetable patch", "veg patch"])
+    if "weeding" in services and "[assumed: where the weeding is needed]" in low and "[assumed: approximate weeding area dimensions]" in low:
+        pass
+    elif "weeding" in services:
+        has_standard_weeding_place = any(w in low for w in ["beds", "bed", "drive", "driveway", "patio", "border", "borders", "path", "paths", "front garden", "back garden", "side garden", "all over", "everywhere", "whole garden", "vegetable patch", "veg patch"])
+        has_lawn_weeding_place = bool(
+            re.search(r"\bweed(?:ing|s)?\b.{0,20}\b(on|in|from|across)\b.{0,20}\b(lawn|lawns|grass|turf)\b", low, re.S)
+            or re.search(r"\b(lawn|lawns|grass|turf)\b.{0,20}\bweed(?:s)?\b", low, re.S)
+        )
+        has_weeding_place = has_standard_weeding_place or has_lawn_weeding_place
         has_weeding_dimensions = find_weeding_dimensions(text)
-        if not has_weeding_place:
+        if not has_weeding_place and "[assumed: where the weeding is needed]" not in low:
             missing.append("where the weeding is needed")
-        if not has_weeding_dimensions:
+        if not has_weeding_dimensions and "[assumed: approximate weeding area dimensions]" not in low:
             missing.append("approximate weeding area dimensions")
     return missing
 
@@ -503,7 +571,7 @@ def data_subject_request(text: str) -> bool:
 
 def general_opener(text: str) -> bool:
     low = text.strip().lower()
-    return bool(re.fullmatch(r"(hi|hello|hey|hey yo|yo|yo yo|hiya|morning|good morning|good afternoon)[!.?\\s]*", low))
+    return bool(re.fullmatch(r"(hi|hello|hey|hey yo|yo|yo yo|hiya|hi there|hello there|hey there|morning|good morning|good afternoon)[!.?\\s]*", low))
 
 def local_conversation_plan(message: str, state: Optional[asyncpg.Record], known_postcode: Optional[str]) -> dict:
     services = find_services(message)
@@ -783,7 +851,7 @@ def one_at_a_time_reply(route: str, missing: list[str], unsupported_note: str = 
         "type of gardening work": service_menu,
         "what gardening work you need": service_menu,
         "rough hedge length/height": "Roughly how long and high are the hedges?",
-        "rough size/amount of waste": "Roughly how much garden waste or clearance is there?",
+        "rough size/amount of waste": "Roughly how much garden waste or clearance is there — for example a few bags, a skip load, small/medium/large, or an approximate area?",
         "where the weeding is needed": "Where is the weeding needed — for example beds, borders, patio, driveway or paths?",
         "approximate weeding area dimensions": "What are the approximate dimensions of the weeding area — for example 3m x 2m or 50m²?",
         "approximate lawn size, for example 100m² or small/medium/large": "Roughly how big is the lawn — for example 100m², or small/medium/large?",
@@ -801,6 +869,57 @@ def pending_missing(state) -> list[str]:
             return []
     return raw if isinstance(raw, list) else []
 
+def services_from_missing_fields(missing: list[str]) -> list[str]:
+    services = []
+    missing_text = " ".join(missing).lower()
+    if "lawn" in missing_text:
+        services.append("lawn_mowing")
+    if "hedge" in missing_text:
+        services.append("hedge_trimming")
+    if "waste" in missing_text or "clearance" in missing_text:
+        services.append("garden_clearance")
+    if "weeding" in missing_text:
+        services.append("weeding")
+    return services
+
+SERVICE_DETAIL_FIELDS = {
+    "approximate lawn size, for example 100m² or small/medium/large",
+    "rough hedge length/height",
+    "rough size/amount of waste",
+    "where the weeding is needed",
+    "approximate weeding area dimensions",
+}
+
+ASSUMPTION_REPLY_PREFIX = "ok thanks, i'll make some assumptions for now"
+
+def noncommittal_detail_response(text: str) -> bool:
+    low = text.lower()
+    return bool(
+        re.search(r"\b(idk|dunno|no idea|no clue|not sure|don't know|dont know|do not know|can't measure|cant measure|can't say|hard to say|never measured)\b", low)
+        or re.search(r"\b(just guess|you decide|whatever'?s normal|whatever is normal|whatever normal|surprise me|work it out|make an assumption|assume|fair bit)\b", low)
+    )
+
+def assume_repeated_service_detail(state, missing: list[str], latest_message: str) -> tuple[list[str], list[str]]:
+    if not state or not missing:
+        return missing, []
+    if not noncommittal_detail_response(latest_message):
+        return missing, []
+    previous = set(pending_missing(state))
+    adjusted = []
+    assumed = []
+    for field in missing:
+        if field in SERVICE_DETAIL_FIELDS and field in previous:
+            assumed.append(field)
+        else:
+            adjusted.append(field)
+    return adjusted, assumed
+
+def add_assumption_notes(text: str, fields: list[str]) -> str:
+    if not fields:
+        return text
+    notes = [f"[assumed: {field}]" for field in fields if f"[assumed: {field}]" not in text]
+    return text + ("\n" if text else "") + "\n".join(notes)
+
 def idem(msg: TestMessage, route: str) -> str:
     raw = msg.provider_message_id or f"{msg.sender_id}:{route}:{msg.message.strip().lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -808,11 +927,66 @@ def idem(msg: TestMessage, route: str) -> str:
 async def audit(con, actor_id, action, allowed, reason=None, entity_type=None, entity_id=None, metadata=None):
     await con.execute("insert into audit_events(id,actor_type,actor_id,action,entity_type,entity_id,allowed,reason,metadata) values($1,'customer',$2,$3,$4,$5,$6,$7,$8)", uuid.uuid4(), actor_id, action, entity_type, str(entity_id) if entity_id else None, allowed, reason, json.dumps(metadata or {}))
 
-async def save_state(con, customer_id, conversation_id: str, route: str, service: Optional[str], postcode: Optional[str], window: Optional[str], original_message: str, missing: list[str], job_id=None):
+def jsonable(obj):
+    if isinstance(obj, (datetime, uuid.UUID)):
+        return str(obj)
+    if isinstance(obj, asyncpg.Record):
+        return {k: jsonable(v) for k, v in dict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [jsonable(v) for v in obj]
+    return obj
+
+def state_snapshot(state) -> dict:
+    if not state:
+        return {}
+    raw = jsonable(state)
+    for key in ("missing_fields", "state_json"):
+        if isinstance(raw.get(key), str):
+            try:
+                raw[key] = json.loads(raw[key])
+            except Exception:
+                pass
+    return raw
+
+async def record_planner_event(con, customer_id, conversation_id: str, provider_message_id: str, state, plan: dict, guardrails: list[str]):
+    await con.execute(
+        """
+        insert into planner_events(id,customer_id,conversation_id,provider_message_id,planner_model,state_before,planner_output,guardrails_applied)
+        values($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8::jsonb)
+        """,
+        uuid.uuid4(), customer_id, conversation_id, provider_message_id, ANTHROPIC_MODEL_FAST,
+        json.dumps(state_snapshot(state)), json.dumps(jsonable(plan)), json.dumps(guardrails),
+    )
+
+async def record_tool_call(con, customer_id, conversation_id: str, provider_message_id: str, tool_name: str, arguments: dict, result: dict, status: str = "succeeded"):
+    await con.execute(
+        """
+        insert into tool_calls(id,customer_id,conversation_id,provider_message_id,tool_name,arguments,result,status)
+        values($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb,$8)
+        """,
+        uuid.uuid4(), customer_id, conversation_id, provider_message_id, tool_name,
+        json.dumps(jsonable(arguments)), json.dumps(jsonable(result)), status,
+    )
+
+async def save_state(con, customer_id, conversation_id: str, route: str, service: Optional[str], postcode: Optional[str], window: Optional[str], original_message: str, missing: list[str], job_id=None, state_patch: Optional[dict] = None):
+    planner_state = {
+        "version": 2,
+        "active_goal": route,
+        "service_type": None if service == "other" else service,
+        "postcode": postcode,
+        "requested_window_text": window,
+        "missing_fields": missing,
+        "job_id": str(job_id) if job_id else None,
+    }
+    if state_patch:
+        planner_state.update(state_patch)
     await con.execute("""
-        insert into conversation_states(id,customer_id,conversation_id,pending_route,service_type,postcode,requested_window_text,original_message,missing_fields,job_id,updated_at)
-        values($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,now())
+        insert into conversation_states(id,customer_id,conversation_id,schema_version,pending_route,service_type,postcode,requested_window_text,original_message,missing_fields,state_json,job_id,updated_at)
+        values($1,$2,$3,2,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,now())
         on conflict (customer_id, conversation_id) do update set
+          schema_version=2,
           pending_route=excluded.pending_route,
           service_type=coalesce(excluded.service_type, conversation_states.service_type),
           postcode=coalesce(excluded.postcode, conversation_states.postcode),
@@ -825,9 +999,10 @@ async def save_state(con, customer_id, conversation_id: str, route: str, service
             else conversation_states.original_message || E'\nFollow-up: ' || excluded.original_message
           end,
           missing_fields=excluded.missing_fields,
+          state_json=conversation_states.state_json || excluded.state_json,
           job_id=coalesce(excluded.job_id, conversation_states.job_id),
           updated_at=now()
-    """, uuid.uuid4(), customer_id, conversation_id, route, None if service == "other" else service, postcode, window, redact(original_message), json.dumps(missing), job_id)
+    """, uuid.uuid4(), customer_id, conversation_id, route, None if service == "other" else service, postcode, window, redact(original_message), json.dumps(missing), json.dumps(planner_state), job_id)
 
 async def clear_state(con, customer_id, conversation_id: str):
     await con.execute("delete from conversation_states where customer_id=$1 and conversation_id=$2", customer_id, conversation_id)
@@ -842,6 +1017,35 @@ async def create_job(con, customer_id, conversation_id: str, service: str, postc
 
 async def latest_quote(con, customer_id):
     return await con.fetchrow("select id, job_id, service_type, description, postcode, status from quote_requests where customer_id=$1 order by created_at desc limit 1", customer_id)
+
+async def active_consultation(con, customer_id):
+    return await con.fetchrow("""
+        select id, job_id, service_type, status, requested_window_text, postcode
+        from appointments
+        where customer_id=$1
+          and objective='initial_consultation'
+          and status in ('requested','proposed','confirmed')
+        order by created_at desc
+        limit 1
+    """, customer_id)
+
+def wants_separate_appointment(text: str) -> bool:
+    return bool(re.search(r"\b(separate|another|new|second)\b.{0,30}\b(appointment|booking|consultation|visit)\b", text.lower()))
+
+def wants_existing_consultation_discussion(text: str) -> bool:
+    low = text.lower()
+    return bool(
+        re.search(r"\b(same|existing|already)\b.{0,40}\b(appointment|booking|consultation|visit)\b", low)
+        or re.search(r"\bdiscuss\b.{0,40}\b(appointment|booking|consultation|visit)\b", low)
+    )
+
+def existing_consultation_reply(row, service: str, quote_created: bool = False) -> str:
+    prefix = "Thanks — I’ve created the quote request. " if quote_created else ""
+    window = row["requested_window_text"] or "the consultation already requested"
+    return (
+        f"{prefix}There’s already an initial consultation requested for {window} in {row['postcode']}. "
+        f"The team can discuss {service_label(service)} at that same consultation, so I won’t create a second appointment request."
+    )
 
 async def update_existing_quote(con, quote_row, message: str):
     note = redact(message)
@@ -905,19 +1109,25 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
         known_postcode = await latest_customer_postcode(con, customer_id)
         plan = await conversation_plan(msg.message, customer, state, known_postcode)
         route = (plan.get("route") or "handoff").lower()
+        guardrails_applied = []
         guard_route = hard_guard_route(msg.message)
         # Deterministic logic is only authoritative for hard safety/account guards.
         # Normal inbound chat routing must come from the LLM planner.
         if guard_route:
             route = guard_route
+            guardrails_applied.append(f"hard_guard:{guard_route}")
         if data_subject_request(msg.message):
             route = "handoff"
+            guardrails_applied.append("account_guard:data_subject_request")
         if is_bogus_personal_service(msg.message):
             route = "handoff"
+            guardrails_applied.append("safety_guard:personal_service")
         if route == "unsafe":
             route = "unsafe"
         elif route not in {"faq","quote","booking","quote_update","cancel","status","handoff","edit"}:
             route = "handoff"
+            guardrails_applied.append("schema_guard:unknown_route")
+        await record_planner_event(con, customer_id, conversation_id, provider_message_id, state, {**plan, "effective_route": route}, guardrails_applied)
         greeting_used = False
 
         def start_prefix() -> str:
@@ -942,14 +1152,22 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             await audit(con, msg.sender_id, "unsafe_request_refused", False, "high_risk_intent", "message", provider_message_id)
             hid = uuid.uuid4()
             await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'security','urgent',$3)", hid, customer_id, redact(msg.message))
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_handoff_case", {"reason": "security", "priority": "urgent"}, {"handoff_id": hid})
             return await respond({"ok": True, "route": "handoff", "handoff_required": True, "handoff_id": str(hid), "reply": "I can’t access or share customer records. I can help with your own gardening enquiry, booking or quote request."})
 
         postcode = plan.get("postcode") or find_postcode(msg.message)
         if postcode:
             postcode = format_postcode(postcode)
         plan_services_raw = plan.get("services") or []
-        planned_services = [x for x in plan_services_raw if x in SERVICES]
-        current_services = planned_services or find_services(msg.message)
+        message_services = find_services(msg.message)
+        previous_services_for_validation = state["service_type"].split("+") if state and state["service_type"] else []
+        planned_services = [
+            x for x in plan_services_raw
+            if x in SERVICES and (x in message_services or x in previous_services_for_validation)
+        ]
+        current_services = list(dict.fromkeys(planned_services + message_services))
+        if weeding_location_context(state, msg.message):
+            current_services = [svc for svc in current_services if svc != "lawn_mowing"]
         if is_bogus_personal_service(msg.message):
             current_services = []
         service = service_key(current_services) if current_services else find_service(msg.message)
@@ -967,6 +1185,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
         ):
             route = "quote"
         if re.search(r"\b(move|reschedule|change)\b.{0,40}\b(that|appointment|booking|visit|request)\b|\b(that|appointment|booking|visit|request)\b.{0,40}\b(move|reschedule|change)\b", msg.message.lower()):
+            route = "booking"
+        if wants_existing_consultation_discussion(msg.message) and service != "other":
             route = "booking"
         if route == "handoff" and not explicit_human_handoff(msg.message) and explicit_booking_intent(msg.message) and service != "other":
             route = "booking"
@@ -1003,6 +1223,18 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             route = "quote"
         original_message = state["original_message"] if state else redact(msg.message)
         combined_note = original_message if original_message == redact(msg.message) else f"{original_message}\nFollow-up: {redact(msg.message)}"
+        if route in {"quote", "booking", "edit"} and not re.search(r"\b(change of plan|actually|instead|rather)\b", combined_note.lower()):
+            note_services = find_services(combined_note)
+            if state and state["service_type"]:
+                note_services = state["service_type"].split("+") + services_from_missing_fields(pending_missing(state)) + note_services
+            if weeding_location_context(state, msg.message):
+                note_services = [svc for svc in note_services if svc != "lawn_mowing"]
+            if pending_weeding_flow(state) and not explicit_lawn_work(msg.message):
+                note_services = [svc for svc in note_services if svc != "lawn_mowing"]
+            for negated in negated_services(msg.message):
+                note_services = [svc for svc in note_services if svc != negated]
+            if note_services:
+                service = service_key(note_services)
         fallback_name = extract_name(combined_note)
         fallback_phone = extract_phone(combined_note)
         if fallback_name or fallback_phone:
@@ -1020,6 +1252,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             await audit(con, msg.sender_id, "data_subject_request_handoff", True, "customer_data_rights_request", "message", provider_message_id)
             hid = uuid.uuid4()
             await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'data_request','normal',$3)", hid, customer_id, redact(msg.message))
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_handoff_case", {"reason": "data_request", "priority": "normal"}, {"handoff_id": hid})
             return await respond({
                 "ok": True,
                 "route": "handoff",
@@ -1032,6 +1265,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             await audit(con, msg.sender_id, "unsupported_personal_service_refused", False, "personal_grooming_with_gardening_tool", "message", provider_message_id)
             hid = uuid.uuid4()
             await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'unsupported','normal',$3)", hid, customer_id, redact(msg.message))
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_handoff_case", {"reason": "unsupported", "priority": "normal"}, {"handoff_id": hid})
             await clear_state(con, customer_id, conversation_id)
             return await respond({
                 "ok": True,
@@ -1064,6 +1298,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             await audit(con, msg.sender_id, "handoff_requested", True, "customer_or_planner_requested_handoff", "message", provider_message_id)
             hid = uuid.uuid4()
             await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'customer_request','normal',$3)", hid, customer_id, redact(msg.message))
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_handoff_case", {"reason": "customer_request", "priority": "normal"}, {"handoff_id": hid})
             return await respond({
                 "ok": True,
                 "route": "handoff",
@@ -1074,6 +1309,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
 
         if route in ["booking", "edit"]:
             state_job_id = state["job_id"] if state and "job_id" in state else None
+            existing_consultation = await active_consultation(con, customer_id)
             if service == "other" and explicit_booking_intent(msg.message):
                 previous = await con.fetchrow("select job_id, service_type, postcode, customer_notes from appointments where customer_id=$1 order by created_at desc limit 1", customer_id)
                 if previous and re.search(r"\b(instead|again|rebook|book|reschedule|move|change)\b", msg.message.lower()):
@@ -1082,19 +1318,42 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                     postcode = postcode or previous["postcode"]
                     if previous["customer_notes"] and previous["customer_notes"] not in combined_note:
                         combined_note = f"{previous['customer_notes']}\nFollow-up: {redact(msg.message)}"
+            if (
+                existing_consultation
+                and (
+                    (state and state["pending_route"] == "booking" and state_job_id)
+                    or wants_existing_consultation_discussion(msg.message)
+                )
+                and not wants_separate_appointment(msg.message)
+                and not re.search(r"\b(reschedule|rebook|move|change)\b", msg.message.lower())
+            ):
+                await clear_state(con, customer_id, conversation_id)
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "find_active_consultation", {"service_type": service}, {"appointment_id": existing_consultation["id"], "job_id": state_job_id or existing_consultation["job_id"], "status": existing_consultation["status"]})
+                return await respond({
+                    "ok": True,
+                    "route": "booking",
+                    "staff_action_required": True,
+                    "job_id": str(state_job_id or existing_consultation["job_id"]),
+                    "appointment_id": str(existing_consultation["id"]),
+                    "appointment_objective": "initial_consultation",
+                    "status": existing_consultation["status"],
+                    "reply": existing_consultation_reply(existing_consultation, service),
+                })
             missing=[]
             missing.extend(basic_missing)
             if window and not window_has_date_context(window):
                 window = None
             if past_or_impossible_window(window):
                 window = None
-            if outside_consultation_hours(window):
+            if outside_consultation_hours(window) or outside_consultation_hours(msg.message):
                 window = None
             if not window: missing.append("preferred date or time")
             if not postcode: missing.append("postcode")
             if service == "other": missing.append("type of gardening work")
             if not state_job_id:
                 missing.extend(quote_detail_missing(service, combined_note))
+            missing, assumed_detail = assume_repeated_service_detail(state, missing, msg.message)
+            combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
                 reply = outside_hours_reply() if missing[0] == "preferred date or time" and outside_consultation_hours(plan.get("preferred_window") or find_window(msg.message) or msg.message) else one_at_a_time_reply("booking", missing, unsupported_note)
                 await save_state(con, customer_id, conversation_id, "booking", service, postcode, window, combined_note, missing, state_job_id)
@@ -1109,17 +1368,30 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 jid = state_job_id or await create_job(con, customer_id, conversation_id, service, postcode, combined_note, "initial_consultation")
                 await con.execute("insert into appointments(id,customer_id,job_id,objective,service_type,status,requested_window_text,postcode,customer_notes,idempotency_key) values($1,$2,$3,'initial_consultation',$4,'requested',$5,$6,$7,$8)", aid, customer_id, jid, service, window, postcode, combined_note, key)
                 await audit(con, msg.sender_id, "appointment_request_created", True, None, "appointment", aid)
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid}, {"appointment_id": aid, "job_id": jid})
             await clear_state(con, customer_id, conversation_id)
-            return await respond({"ok": True, "route": "booking", "staff_action_required": True, "job_id": str(jid) if jid else None, "appointment_id": str(aid), "appointment_objective": "initial_consultation", "status": "requested", "reply": f"I’ve created a job and requested an initial consultation for {service_label(service)} for {window} in {postcode}. The team will confirm availability shortly."})
+            assumption_text = ASSUMPTION_REPLY_PREFIX + ". " if assumed_detail else ""
+            return await respond({"ok": True, "route": "booking", "staff_action_required": True, "job_id": str(jid) if jid else None, "appointment_id": str(aid), "appointment_objective": "initial_consultation", "status": "requested", "reply": f"{assumption_text}I’ve created a job and requested an initial consultation for {service_label(service)} for {window} in {postcode}. The team will confirm availability shortly."})
 
         if route == "quote":
             existing_quote = await latest_quote(con, customer_id)
+            existing_consultation = await active_consultation(con, customer_id)
             if wants_quote_summary(msg.message) and existing_quote:
                 return await respond({"ok": True, "route": "quote_update", "staff_action_required": False, "quote_request_id": str(existing_quote["id"]), "reply": quote_summary_reply(existing_quote, state)})
             if wants_quote_summary(msg.message):
                 return await respond({"ok": True, "route": "quote", "staff_action_required": False, "reply": "I can’t find a quote request linked to this test customer yet. Please start a quote request first or ask the team to check manually."})
             area_m2 = find_area_m2(msg.message)
             state_job_id = state["job_id"] if state and "job_id" in state else None
+            if existing_quote and noncommittal_detail_response(msg.message) and not find_services(msg.message) and not find_postcode(msg.message):
+                await update_existing_quote(con, existing_quote, msg.message)
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
+                return await respond({
+                    "ok": True,
+                    "route": "quote_update",
+                    "staff_action_required": True,
+                    "quote_request_id": str(existing_quote["id"]),
+                    "reply": f"Thanks — I’ve added that note to your quote request for {service_label(existing_quote['service_type'])} in {existing_quote['postcode']}. The team will use the assumptions already flagged when confirming the final price.",
+                })
             if existing_quote and state_job_id and str(existing_quote["job_id"]) == str(state_job_id):
                 missing_for_merged = list(basic_missing)
                 if service == "other": missing_for_merged.append("what gardening work you need")
@@ -1127,12 +1399,25 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 missing_for_merged.extend(quote_detail_missing(service, combined_note))
                 if not missing_for_merged and service != existing_quote["service_type"]:
                     await update_quote_work(con, existing_quote, service, combined_note)
+                    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "service_type": service, "postcode": postcode}, {"quote_request_id": existing_quote["id"], "job_id": state_job_id})
                     estimate = quote_estimate(service, find_area_m2(combined_note), combined_note)
                     estimate_text = f" Rough guide: {estimate}." if estimate else ""
+                    if existing_consultation and not wants_separate_appointment(msg.message):
+                        await clear_state(con, customer_id, conversation_id)
+                        return await respond({
+                            "ok": True,
+                            "route": "quote_update",
+                            "staff_action_required": True,
+                            "job_id": str(state_job_id),
+                            "quote_request_id": str(existing_quote["id"]),
+                            "appointment_id": str(existing_consultation["id"]),
+                            "reply": f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} There’s already an initial consultation requested for {existing_consultation['requested_window_text']} in {existing_consultation['postcode']}. The team can discuss this at that same consultation.",
+                        })
                     await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], state_job_id)
                     return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "job_id": str(state_job_id), "quote_request_id": str(existing_quote["id"]), "reply": f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} The best next step is still an initial consultation so the team can confirm the details and final price. Please share a couple of dates/times that work for you."})
             if existing_quote and (area_m2 or service == "other" or not postcode):
                 await update_existing_quote(con, existing_quote, msg.message)
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
                 estimate = quote_estimate(existing_quote["service_type"], area_m2, (existing_quote["description"] or "") + "\n" + msg.message)
                 if estimate:
                     reply = f"For {area_m2}m² of {service_label(existing_quote['service_type'])}, a rough guide is {estimate}. I’ve added that detail to your quote request for {existing_quote['postcode']}. The team will still confirm the final price after review."
@@ -1143,6 +1428,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             if service == "other": missing.append("what gardening work you need")
             if not postcode: missing.append("postcode")
             missing.extend(quote_detail_missing(service, combined_note))
+            missing, assumed_detail = assume_repeated_service_detail(state, missing, msg.message)
+            combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
                 await save_state(con, customer_id, conversation_id, "quote", service, postcode, window, combined_note, missing)
                 reply = one_at_a_time_reply("quote", missing, unsupported_note)
@@ -1150,6 +1437,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             qid = uuid.uuid4(); key=idem(msg,"quote")
             jid = await create_job(con, customer_id, conversation_id, service, postcode, combined_note, "initial_consultation")
             await con.execute("insert into quote_requests(id,customer_id,job_id,service_type,description,postcode,status,idempotency_key) values($1,$2,$3,$4,$5,$6,'new',$7) on conflict (idempotency_key) do nothing", qid, customer_id, jid, service, combined_note, postcode, key)
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_quote_request", {"service_type": service, "postcode": postcode, "job_id": jid}, {"quote_request_id": qid, "job_id": jid})
             appointment_id = None
             appointment_text = ""
             if window:
@@ -1166,22 +1454,31 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                     })
                 appointment_id = uuid.uuid4()
                 await con.execute("insert into appointments(id,customer_id,job_id,objective,service_type,status,requested_window_text,postcode,customer_notes,idempotency_key) values($1,$2,$3,'initial_consultation',$4,'requested',$5,$6,$7,$8) on conflict (idempotency_key) do nothing", appointment_id, customer_id, jid, service, window, postcode, combined_note, idem(msg, "quote-consultation"))
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid}, {"appointment_id": appointment_id, "job_id": jid})
                 appointment_text = f" I’ve also requested an initial consultation for {window}; the team will confirm availability."
             estimate = quote_estimate(service, find_area_m2(combined_note), combined_note)
             estimate_text = f" Rough guide: {estimate}." if estimate else ""
+            assumption_text = ASSUMPTION_REPLY_PREFIX + ". " if assumed_detail else ""
             if appointment_id:
                 await clear_state(con, customer_id, conversation_id)
                 consultation_text = appointment_text
+                response_appointment_id = appointment_id
+            elif existing_consultation and not wants_separate_appointment(msg.message):
+                await clear_state(con, customer_id, conversation_id)
+                consultation_text = f" There’s already an initial consultation requested for {existing_consultation['requested_window_text']} in {existing_consultation['postcode']}. The team can discuss this at that same consultation."
+                response_appointment_id = existing_consultation["id"]
             else:
                 await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid)
                 consultation_text = " " + consultation_options_text()
-            return await respond({"ok": True, "route": "quote", "staff_action_required": True, "job_id": str(jid), "quote_request_id": str(qid), "appointment_id": str(appointment_id) if appointment_id else None, "recommended_appointment_objective": "initial_consultation", "suggested_windows": [], "reply": f"Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"})
+                response_appointment_id = None
+            return await respond({"ok": True, "route": "quote", "staff_action_required": True, "job_id": str(jid), "quote_request_id": str(qid), "appointment_id": str(response_appointment_id) if response_appointment_id else None, "recommended_appointment_objective": "initial_consultation", "suggested_windows": [], "reply": f"{assumption_text}Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"})
 
         if route in ["cancel", "status"]:
             latest_quote_row = await latest_quote(con, customer_id)
             if latest_quote_row and re.search(r"\bquote\b", msg.message.lower()):
                 if route == "cancel":
                     await con.execute("update quote_requests set status='archived', updated_at=now() where id=$1", latest_quote_row["id"])
+                    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "cancel_quote_request", {"quote_request_id": latest_quote_row["id"]}, {"quote_request_id": latest_quote_row["id"], "status": "archived"})
                     await clear_state(con, customer_id, conversation_id)
                     return await respond({"ok": True, "route": "cancel", "quote_request_id": str(latest_quote_row["id"]), "reply": "I’ve marked your quote request as cancelled for the team to review. No appointment has been changed."})
                 return await respond({"ok": True, "route": "quote_update", "quote_request_id": str(latest_quote_row["id"]), "reply": quote_summary_reply(latest_quote_row, state)})
@@ -1191,6 +1488,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             if route == "cancel":
                 await con.execute("update appointments set status='cancelled', updated_at=now() where id=$1", row["id"])
                 await audit(con, msg.sender_id, "appointment_cancel_requested", True, None, "appointment", row["id"])
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "cancel_consultation_request", {"appointment_id": row["id"]}, {"appointment_id": row["id"], "status": "cancelled"})
                 return await respond({"ok": True, "route": "cancel", "appointment_id": str(row["id"]), "reply": f"I’ve marked your {service_label(row['service_type'])} appointment request as cancellation requested. The team will confirm shortly."})
             return await respond({"ok": True, "route": "status", "appointment_id": str(row["id"]), "reply": f"Your latest {service_label(row['service_type'])} request for {row['requested_window_text']} in {row['postcode']} is currently {row['status']}."})
 
@@ -1213,6 +1511,8 @@ async def summary(x_gardener_test_secret: str | None = Header(default=None)):
             "quotes": await con.fetchval("select count(*) from quote_requests"),
             "handoffs": await con.fetchval("select count(*) from handoff_cases"),
             "audit_events": await con.fetchval("select count(*) from audit_events"),
+            "planner_events": await con.fetchval("select count(*) from planner_events"),
+            "tool_calls": await con.fetchval("select count(*) from tool_calls"),
         }
 
 
@@ -1296,6 +1596,8 @@ async def staff_overview():
             "quotes": await con.fetchval("select count(*) from quote_requests"),
             "handoffs": await con.fetchval("select count(*) from handoff_cases"),
             "audit_events": await con.fetchval("select count(*) from audit_events"),
+            "planner_events": await con.fetchval("select count(*) from planner_events"),
+            "tool_calls": await con.fetchval("select count(*) from tool_calls"),
         }
         jobs = [rowdict(r) for r in await con.fetch("""select j.*, c.sender_id, c.name, string_agg(w.service_type, ', ' order by w.service_type) as work_items from jobs j join customers c on c.id=j.customer_id left join job_work_items w on w.job_id=j.id group by j.id,c.sender_id,c.name order by j.created_at desc limit 100""")]
         appointments = [rowdict(r) for r in await con.fetch("""select a.*, c.sender_id, c.name from appointments a join customers c on c.id=a.customer_id order by a.created_at desc limit 100""")]
@@ -1316,6 +1618,17 @@ async def staff_conversation(conversation_id: str):
     async with (await db()).acquire() as con:
         rows = await con.fetch("select * from message_events where conversation_id=$1 order by created_at asc", conversation_id)
         return {"conversation_id": conversation_id, "messages": [rowdict(r) for r in rows]}
+
+@app.get("/v1/staff/planner-traces/{conversation_id}")
+async def staff_planner_traces(conversation_id: str):
+    async with (await db()).acquire() as con:
+        planner_rows = await con.fetch("select * from planner_events where conversation_id=$1 order by created_at asc", conversation_id)
+        tool_rows = await con.fetch("select * from tool_calls where conversation_id=$1 order by created_at asc", conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "planner_events": [rowdict(r) for r in planner_rows],
+            "tool_calls": [rowdict(r) for r in tool_rows],
+        }
 
 @app.patch("/v1/staff/appointments/{item_id}/status")
 async def update_appointment_status(item_id: uuid.UUID, patch: StatusPatch):
