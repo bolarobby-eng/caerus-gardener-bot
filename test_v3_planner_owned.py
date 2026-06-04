@@ -79,6 +79,16 @@ def main():
     check("valid quote creates quote", response.get("route") == "quote" and response.get("job_id") and response.get("quote_request_id"), failures)
     check("valid quote reply is planner-owned", response.get("reply") == planner_reply(conv), failures)
 
+    sender = f"v3-regression-weeding-scope-{RUN}"
+    conv = f"{sender}-conv"
+    post(sender, conv, "My name is Scope Check, my number is 07123 955102 and the address is 12 Scope Road DE23 8HJ. I need a quote for lawn mowing, lawn is 50m2.", 1)
+    post(sender, conv, "I'd also like weeding done on the lawn", 2)
+    post(sender, conv, "It's all over the lawn. Next Friday for an initial consultation?", 3)
+    response = post(sender, conv, "Just a few patches, probably half of the lawn", 4)
+    reply = response.get("reply", "").lower()
+    check("weeding scope reply is planner-owned", response.get("reply") == planner_reply(conv), failures)
+    check("qualitative weeding scope accepted", "how many square" not in reply and "dimensions" not in reply and "lawn size" not in reply and "how big is your lawn" not in reply, failures)
+
     result = {"ok": not failures, "failures": failures}
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if not failures else 1)

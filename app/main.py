@@ -403,6 +403,18 @@ def find_weeding_dimensions(text: str) -> bool:
         or re.search(r"(?:weed(?:ing)?|weeds?|bed|beds|drive|patio|border|borders|path|paths).{0,60}\b\d+(?:\.\d+)?\s*(?:m|metres?|meters?|ft|feet)\s*(?:long|wide|length|width)\b", low, re.S)
     )
 
+def find_weeding_scope(text: str) -> bool:
+    low = text.lower()
+    if find_weeding_dimensions(text):
+        return True
+    return bool(
+        re.search(r"\b(whole|all|entire)\s+(?:of\s+the\s+)?(?:lawn|garden|area|beds?|borders?|patio|driveway|path|paths)\b", low)
+        or re.search(r"\bhalf\s+(?:of\s+)?(?:the\s+)?(?:lawn|garden|area|beds?|borders?|patio|driveway|path|paths)\b", low)
+        or re.search(r"\b(?:few|couple of|several|small|large|some)\s+patch(?:es)?\b", low)
+        or re.search(r"\bpatch(?:es)?\s+(?:across|on|over|in)\s+(?:the\s+)?(?:lawn|garden|area|beds?|borders?)\b", low)
+        or re.search(r"\b(?:all over|scattered across|spread across)\s+(?:the\s+)?(?:lawn|garden|area|beds?|borders?)\b", low)
+    )
+
 def find_area_m2(text: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\s*(?:m2|m²|sqm|sq\s*m|square\s*met(?:er|re)s?)\b", text, re.I)
     return int(m.group(1)) if m else None
@@ -468,7 +480,7 @@ def quote_detail_missing(service: str, text: str) -> list[str]:
             or re.search(r"\b(lawn|lawns|grass|turf)\b.{0,20}\bweed(?:s)?\b", low, re.S)
         )
         has_weeding_place = has_standard_weeding_place or has_lawn_weeding_place
-        has_weeding_dimensions = find_weeding_dimensions(text)
+        has_weeding_dimensions = find_weeding_scope(text)
         if not has_weeding_place and "[assumed: where the weeding is needed]" not in low:
             missing.append("where the weeding is needed")
         if not has_weeding_dimensions and "[assumed: approximate weeding area dimensions]" not in low:
@@ -683,7 +695,7 @@ Information needed before creating a quote:
   - lawn_mowing: approximate lawn size, e.g. 100m2/small/medium/large
   - hedge_trimming: rough hedge length/height
   - garden_clearance: rough size/amount of waste
-  - weeding: where the weeding is needed, plus approximate dimensions/area as a separate detail (e.g. 3m x 2m or 50m2)
+  - weeding: where the weeding is needed, plus approximate scope as a separate detail. Numeric dimensions are useful, but qualitative scope such as "a few patches", "half the lawn", "the whole lawn", or "all over the borders" is acceptable.
 - If the customer mentions unsupported/non-gardening services (e.g. massage), politely say that part is outside scope and do not include it in workflow services. Continue with valid gardening services if details are sufficient; otherwise ask for missing valid-service details.
 - If the whole request is outside gardening scope, such as building work, loft conversions, extra floors, roof work, car cleaning, pest control, pressure washing, fence repair or tree surgery, route `faq`, explain it is outside scope, and remind them you can help with lawn mowing, hedge trimming, weeding, planting, garden clearance and garden design. Do not route handoff just because the request is outside scope.
 - If the customer makes a nonsense or personal-grooming request involving gardening tools, such as trimming a beard with a lawn mower, route handoff/unsupported and do not treat tool words as gardening services.
