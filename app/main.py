@@ -478,6 +478,8 @@ def quote_detail_missing(service: str, text: str) -> list[str]:
 def unsupported_services(text: str) -> list[str]:
     low = text.lower()
     found = []
+    if re.search(r"\b(loft conversion|convert(?:ed|ing)? (?:my )?loft|loft convert(?:ed|ing|sion)?|extra floor|new floor|another floor|extension|building work|builder|building contractor|renovation|roof conversion)\b", low):
+        found.append("building work")
     if any(w in low for w in ["massage", "back rub", "physio", "haircut", "clean my car"]):
         if "massage" in low:
             found.append("back massage")
@@ -572,6 +574,9 @@ def data_subject_request(text: str) -> bool:
 def general_opener(text: str) -> bool:
     low = text.strip().lower()
     return bool(re.fullmatch(r"(hi|hello|hey|hey yo|yo|yo yo|hiya|hi there|hello there|hey there|morning|good morning|good afternoon)[!.?\\s]*", low))
+
+def starts_with_greeting(text: str) -> bool:
+    return bool(re.match(r"\s*(hi|hello|hey|hiya|welcome)\b", text.strip().lower()))
 
 def local_conversation_plan(message: str, state: Optional[asyncpg.Record], known_postcode: Optional[str]) -> dict:
     services = find_services(message)
@@ -1141,7 +1146,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             nonlocal greeting_used
             reply = str(payload.get("reply", ""))
             if reply and first_turn_in_conversation and not greeting_used:
-                reply = start_prefix() + reply if reply else start_prefix()
+                if not starts_with_greeting(reply):
+                    reply = start_prefix() + reply
                 payload["reply"] = reply
                 greeting_used = True
             if reply:
@@ -1285,13 +1291,11 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             })
 
         if first_turn_in_conversation and not state and basic_missing and general_opener(msg.message):
-            await save_state(con, customer_id, conversation_id, "quote", service, postcode, window, combined_note, basic_missing)
             return await respond({
                 "ok": True,
-                "route": "quote",
+                "route": "faq",
                 "staff_action_required": False,
-                "reply": one_at_a_time_reply("quote", basic_missing, unsupported_note),
-                "missing_fields": basic_missing,
+                "reply": plan.get("reply") or f"Hi, welcome to {BUSINESS_NAME}. How can we help with your garden today?",
             })
 
         if route == "handoff":
