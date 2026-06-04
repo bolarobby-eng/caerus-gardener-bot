@@ -15,7 +15,7 @@ ANTHROPIC_MODEL_FAST = os.getenv("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5-20251
 ANTHROPIC_MODEL_SMART = os.getenv("ANTHROPIC_MODEL_SMART", "claude-sonnet-4-5-20250929")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Caerus Gardener Bot")
 
-app = FastAPI(title="Caerus Gardener Bot API", version="0.2.0")
+app = FastAPI(title="Caerus Gardener Bot API", version="0.3.0")
 pool: asyncpg.Pool | None = None
 
 SERVICES = {
@@ -182,7 +182,7 @@ async def init_db():
       id uuid primary key,
       customer_id uuid references customers(id),
       conversation_id text not null,
-      schema_version integer not null default 2,
+      schema_version integer not null default 3,
       pending_route text not null,
       service_type text,
       postcode text,
@@ -196,7 +196,7 @@ async def init_db():
       unique(customer_id, conversation_id)
     );
     alter table conversation_states add column if not exists job_id uuid references jobs(id);
-    alter table conversation_states add column if not exists schema_version integer not null default 2;
+    alter table conversation_states add column if not exists schema_version integer not null default 3;
     alter table conversation_states add column if not exists state_json jsonb not null default '{}'::jsonb;
     create table if not exists planner_events (
       id uuid primary key,
@@ -575,9 +575,6 @@ def general_opener(text: str) -> bool:
     low = text.strip().lower()
     return bool(re.fullmatch(r"(hi|hello|hey|hey yo|yo|yo yo|hiya|hi there|hello there|hey there|morning|good morning|good afternoon)[!.?\\s]*", low))
 
-def starts_with_greeting(text: str) -> bool:
-    return bool(re.match(r"\s*(hi|hello|hey|hiya|welcome)\b", text.strip().lower()))
-
 def local_conversation_plan(message: str, state: Optional[asyncpg.Record], known_postcode: Optional[str]) -> dict:
     services = find_services(message)
     route = "quote"
@@ -666,7 +663,8 @@ async def conversation_plan(message: str, customer: Optional[asyncpg.Record], st
     system = f"""
 You are the conversation brain for {BUSINESS_NAME}, a local gardening service.
 Return ONLY valid JSON. No markdown.
-Your job: understand the customer's latest message in context, keep the conversation natural, and decide whether enough information exists to trigger a backend workflow.
+This is the v3 planner-owned runtime. Your job is to chat naturally with the customer, decide which route/flow to follow, gather the relevant details, and decide when the backend should execute the workflow for that route.
+The backend validates and executes tools, but your `reply` is the normal customer-facing message. Do not rely on backend-authored intake scripts.
 
 Supported routes: faq, quote, booking, quote_update, cancel, status, handoff, unsafe.
 Services: lawn_mowing, hedge_trimming, weeding, garden_clearance, planting, garden_design.
@@ -687,6 +685,7 @@ Information needed before creating a quote:
   - garden_clearance: rough size/amount of waste
   - weeding: where the weeding is needed, plus approximate dimensions/area as a separate detail (e.g. 3m x 2m or 50m2)
 - If the customer mentions unsupported/non-gardening services (e.g. massage), politely say that part is outside scope and do not include it in workflow services. Continue with valid gardening services if details are sufficient; otherwise ask for missing valid-service details.
+- If the whole request is outside gardening scope, such as building work, loft conversions, extra floors, roof work, car cleaning, pest control, pressure washing, fence repair or tree surgery, route `faq`, explain it is outside scope, and remind them you can help with lawn mowing, hedge trimming, weeding, planting, garden clearance and garden design. Do not route handoff just because the request is outside scope.
 - If the customer makes a nonsense or personal-grooming request involving gardening tools, such as trimming a beard with a lawn mower, route handoff/unsupported and do not treat tool words as gardening services.
 - If the customer explicitly says they do not have a service item, such as "I don't have any hedges", remove that service from the pending workflow instead of asking for its details again.
 - If the customer asks whether the business can help with a supported service, such as "Can you help with planting?", route faq and answer the capability question. Do not start quote intake unless they ask for work, pricing, a quote, or a booking.
@@ -705,9 +704,10 @@ Rules:
 - Preserve/merge services from pending state with newly mentioned services.
 - Use known customer profile/postcode to avoid asking again.
 - Keep reply friendly, concise, and human — never robotic like 'Please send postcode' by itself.
-- If details are missing, ask for ONE step at a time. For new customers, explain that you will take a few details first, then ask for their name. After the name, ask for contact number, then ask for job address and postcode together, then move on to job details.
-- If ready, reply as if the workflow will be created and mention staff will confirm final price/time.
+- If details are missing, ask for ONE sensible next step in your own words. Be conversational and context-aware. Avoid fixed template phrases.
+- If ready, reply as if the workflow/API call is being made now and mention staff will confirm final price/time.
 - Do not invent appointment availability or say fixed slots are available. Ask the customer for their available dates/times instead.
+- Use `handoff` only when the customer explicitly asks for a human/staff member, makes a complaint/legal threat, asks for data rights handling, or the request is unsafe/security/privacy-sensitive.
 
 JSON schema:
 {{
@@ -863,6 +863,12 @@ def one_at_a_time_reply(route: str, missing: list[str], unsupported_note: str = 
     }
     return questions.get(field, f"Could you send {field}?") + unsupported_note
 
+def planner_reply(plan: dict, fallback: str = "") -> str:
+    reply = plan.get("reply") if isinstance(plan, dict) else None
+    if isinstance(reply, str) and reply.strip():
+        return reply.strip()
+    return fallback
+
 def pending_missing(state) -> list[str]:
     if not state:
         return []
@@ -977,7 +983,7 @@ async def record_tool_call(con, customer_id, conversation_id: str, provider_mess
 
 async def save_state(con, customer_id, conversation_id: str, route: str, service: Optional[str], postcode: Optional[str], window: Optional[str], original_message: str, missing: list[str], job_id=None, state_patch: Optional[dict] = None):
     planner_state = {
-        "version": 2,
+        "version": 3,
         "active_goal": route,
         "service_type": None if service == "other" else service,
         "postcode": postcode,
@@ -989,9 +995,9 @@ async def save_state(con, customer_id, conversation_id: str, route: str, service
         planner_state.update(state_patch)
     await con.execute("""
         insert into conversation_states(id,customer_id,conversation_id,schema_version,pending_route,service_type,postcode,requested_window_text,original_message,missing_fields,state_json,job_id,updated_at)
-        values($1,$2,$3,2,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,now())
+        values($1,$2,$3,3,$4,$5,$6,$7,$8,$9::jsonb,$10::jsonb,$11,now())
         on conflict (customer_id, conversation_id) do update set
-          schema_version=2,
+          schema_version=3,
           pending_route=excluded.pending_route,
           service_type=coalesce(excluded.service_type, conversation_states.service_type),
           postcode=coalesce(excluded.postcode, conversation_states.postcode),
@@ -1133,23 +1139,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             route = "handoff"
             guardrails_applied.append("schema_guard:unknown_route")
         await record_planner_event(con, customer_id, conversation_id, provider_message_id, state, {**plan, "effective_route": route}, guardrails_applied)
-        greeting_used = False
-
-        def start_prefix() -> str:
-            if not first_turn_in_conversation:
-                return ""
-            if customer and customer["name"]:
-                return f"Hi {customer['name']} — "
-            return f"Hi, welcome to {BUSINESS_NAME}. I’ll treat you as a new customer for this conversation. "
-
         async def respond(payload: dict):
-            nonlocal greeting_used
             reply = str(payload.get("reply", ""))
-            if reply and first_turn_in_conversation and not greeting_used:
-                if not starts_with_greeting(reply):
-                    reply = start_prefix() + reply
-                payload["reply"] = reply
-                greeting_used = True
             if reply:
                 await con.execute("insert into message_events(id,provider,provider_message_id,sender_id,conversation_id,direction,body_redacted,processed_at) values($1,$2,$3,$4,$5,'outbound',$6,now()) on conflict do nothing", uuid.uuid4(), msg.channel, provider_message_id + ":out", msg.sender_id, conversation_id, redact(reply))
             return payload
@@ -1287,7 +1278,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 "ok": True,
                 "route": "faq",
                 "staff_action_required": False,
-                "reply": "I can’t help with " + human_join(unsupported) + ". I can help with gardening work such as lawn mowing, hedge trimming, weeding, planting, garden clearance or garden design.",
+                "reply": planner_reply(plan, "I can’t help with " + human_join(unsupported) + ". I can help with gardening work such as lawn mowing, hedge trimming, weeding, planting, garden clearance or garden design."),
             })
 
         if first_turn_in_conversation and not state and basic_missing and general_opener(msg.message):
@@ -1299,6 +1290,14 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             })
 
         if route == "handoff":
+            if unsupported and service == "other" and not explicit_human_handoff(msg.message):
+                await clear_state(con, customer_id, conversation_id)
+                return await respond({
+                    "ok": True,
+                    "route": "faq",
+                    "staff_action_required": False,
+                    "reply": planner_reply(plan, "I can’t help with " + human_join(unsupported) + ". I can help with gardening work such as lawn mowing, hedge trimming, weeding, planting, garden clearance or garden design."),
+                })
             await audit(con, msg.sender_id, "handoff_requested", True, "customer_or_planner_requested_handoff", "message", provider_message_id)
             hid = uuid.uuid4()
             await con.execute("insert into handoff_cases(id,customer_id,reason,priority,safe_summary) values($1,$2,'customer_request','normal',$3)", hid, customer_id, redact(msg.message))
@@ -1308,7 +1307,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 "route": "handoff",
                 "handoff_required": True,
                 "handoff_id": str(hid),
-                "reply": "No problem — I’ll flag this for the team to review. If you can share a short summary of what you need, they’ll have the right context when they pick it up.",
+                "reply": planner_reply(plan, "I’ll flag this for the team to review."),
             })
 
         if route in ["booking", "edit"]:
@@ -1359,7 +1358,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             missing, assumed_detail = assume_repeated_service_detail(state, missing, msg.message)
             combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
-                reply = outside_hours_reply() if missing[0] == "preferred date or time" and outside_consultation_hours(plan.get("preferred_window") or find_window(msg.message) or msg.message) else one_at_a_time_reply("booking", missing, unsupported_note)
+                reply = outside_hours_reply() if missing[0] == "preferred date or time" and outside_consultation_hours(plan.get("preferred_window") or find_window(msg.message) or msg.message) else planner_reply(plan, one_at_a_time_reply("booking", missing, unsupported_note))
                 await save_state(con, customer_id, conversation_id, "booking", service, postcode, window, combined_note, missing, state_job_id)
                 return await respond({"ok": True, "route": "booking", "staff_action_required": False, "reply": reply, "missing_fields": missing})
             key = idem(msg, "appointment")
@@ -1375,7 +1374,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid}, {"appointment_id": aid, "job_id": jid})
             await clear_state(con, customer_id, conversation_id)
             assumption_text = ASSUMPTION_REPLY_PREFIX + ". " if assumed_detail else ""
-            return await respond({"ok": True, "route": "booking", "staff_action_required": True, "job_id": str(jid) if jid else None, "appointment_id": str(aid), "appointment_objective": "initial_consultation", "status": "requested", "reply": f"{assumption_text}I’ve created a job and requested an initial consultation for {service_label(service)} for {window} in {postcode}. The team will confirm availability shortly."})
+            fallback_reply = f"{assumption_text}I’ve created a job and requested an initial consultation for {service_label(service)} for {window} in {postcode}. The team will confirm availability shortly."
+            return await respond({"ok": True, "route": "booking", "staff_action_required": True, "job_id": str(jid) if jid else None, "appointment_id": str(aid), "appointment_objective": "initial_consultation", "status": "requested", "reply": planner_reply(plan, fallback_reply)})
 
         if route == "quote":
             existing_quote = await latest_quote(con, customer_id)
@@ -1389,12 +1389,13 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             if existing_quote and noncommittal_detail_response(msg.message) and not find_services(msg.message) and not find_postcode(msg.message):
                 await update_existing_quote(con, existing_quote, msg.message)
                 await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
+                fallback_reply = f"Thanks — I’ve added that note to your quote request for {service_label(existing_quote['service_type'])} in {existing_quote['postcode']}. The team will use the assumptions already flagged when confirming the final price."
                 return await respond({
                     "ok": True,
                     "route": "quote_update",
                     "staff_action_required": True,
                     "quote_request_id": str(existing_quote["id"]),
-                    "reply": f"Thanks — I’ve added that note to your quote request for {service_label(existing_quote['service_type'])} in {existing_quote['postcode']}. The team will use the assumptions already flagged when confirming the final price.",
+                    "reply": planner_reply(plan, fallback_reply),
                 })
             if existing_quote and state_job_id and str(existing_quote["job_id"]) == str(state_job_id):
                 missing_for_merged = list(basic_missing)
@@ -1408,6 +1409,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                     estimate_text = f" Rough guide: {estimate}." if estimate else ""
                     if existing_consultation and not wants_separate_appointment(msg.message):
                         await clear_state(con, customer_id, conversation_id)
+                        fallback_reply = f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} There’s already an initial consultation requested for {existing_consultation['requested_window_text']} in {existing_consultation['postcode']}. The team can discuss this at that same consultation."
                         return await respond({
                             "ok": True,
                             "route": "quote_update",
@@ -1415,10 +1417,11 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                             "job_id": str(state_job_id),
                             "quote_request_id": str(existing_quote["id"]),
                             "appointment_id": str(existing_consultation["id"]),
-                            "reply": f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} There’s already an initial consultation requested for {existing_consultation['requested_window_text']} in {existing_consultation['postcode']}. The team can discuss this at that same consultation.",
+                            "reply": planner_reply(plan, fallback_reply),
                         })
                     await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], state_job_id)
-                    return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "job_id": str(state_job_id), "quote_request_id": str(existing_quote["id"]), "reply": f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} The best next step is still an initial consultation so the team can confirm the details and final price. Please share a couple of dates/times that work for you."})
+                    fallback_reply = f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} The best next step is still an initial consultation so the team can confirm the details and final price. Please share a couple of dates/times that work for you."
+                    return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "job_id": str(state_job_id), "quote_request_id": str(existing_quote["id"]), "reply": planner_reply(plan, fallback_reply)})
             if existing_quote and (area_m2 or service == "other" or not postcode):
                 await update_existing_quote(con, existing_quote, msg.message)
                 await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
@@ -1427,7 +1430,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                     reply = f"For {area_m2}m² of {service_label(existing_quote['service_type'])}, a rough guide is {estimate}. I’ve added that detail to your quote request for {existing_quote['postcode']}. The team will still confirm the final price after review."
                 else:
                     reply = f"Thanks — I’ve added that detail to your quote request for {service_label(existing_quote['service_type'])} in {existing_quote['postcode']}. The team will use it when confirming the price."
-                return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "quote_request_id": str(existing_quote["id"]), "reply": reply})
+                return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "quote_request_id": str(existing_quote["id"]), "reply": planner_reply(plan, reply)})
             missing=list(basic_missing)
             if service == "other": missing.append("what gardening work you need")
             if not postcode: missing.append("postcode")
@@ -1436,7 +1439,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
                 await save_state(con, customer_id, conversation_id, "quote", service, postcode, window, combined_note, missing)
-                reply = one_at_a_time_reply("quote", missing, unsupported_note)
+                reply = planner_reply(plan, one_at_a_time_reply("quote", missing, unsupported_note))
                 return await respond({"ok": True, "route": "quote", "staff_action_required": False, "reply": reply, "missing_fields": missing})
             qid = uuid.uuid4(); key=idem(msg,"quote")
             jid = await create_job(con, customer_id, conversation_id, service, postcode, combined_note, "initial_consultation")
@@ -1475,7 +1478,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid)
                 consultation_text = " " + consultation_options_text()
                 response_appointment_id = None
-            return await respond({"ok": True, "route": "quote", "staff_action_required": True, "job_id": str(jid), "quote_request_id": str(qid), "appointment_id": str(response_appointment_id) if response_appointment_id else None, "recommended_appointment_objective": "initial_consultation", "suggested_windows": [], "reply": f"{assumption_text}Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"})
+            fallback_reply = f"{assumption_text}Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"
+            return await respond({"ok": True, "route": "quote", "staff_action_required": True, "job_id": str(jid), "quote_request_id": str(qid), "appointment_id": str(response_appointment_id) if response_appointment_id else None, "recommended_appointment_objective": "initial_consultation", "suggested_windows": [], "reply": planner_reply(plan, fallback_reply)})
 
         if route in ["cancel", "status"]:
             latest_quote_row = await latest_quote(con, customer_id)
