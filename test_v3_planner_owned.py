@@ -34,13 +34,18 @@ def traces(conv):
 
 
 def planner_reply(conv):
+    output = planner_output(conv)
+    return output.get("reply", "")
+
+
+def planner_output(conv):
     events = traces(conv).get("planner_events", [])
     if not events:
-        return ""
+        return {}
     output = events[-1].get("planner_output")
     if isinstance(output, str):
         output = json.loads(output)
-    return output.get("reply", "")
+    return output
 
 
 def check(name, condition, failures):
@@ -82,12 +87,13 @@ def main():
     sender = f"v3-regression-weeding-scope-{RUN}"
     conv = f"{sender}-conv"
     post(sender, conv, "My name is Scope Check, my number is 07123 955102 and the address is 12 Scope Road DE23 8HJ. I need a quote for lawn mowing, lawn is 50m2.", 1)
-    post(sender, conv, "I'd also like weeding done on the lawn", 2)
-    post(sender, conv, "It's all over the lawn. Next Friday for an initial consultation?", 3)
-    response = post(sender, conv, "Just a few patches, probably half of the lawn", 4)
+    response = post(sender, conv, "I'd also like weeding done on half of the lawn", 2)
     reply = response.get("reply", "").lower()
+    output = planner_output(conv)
+    weeding = output.get("service_details", {}).get("weeding", {})
     check("weeding scope reply is planner-owned", response.get("reply") == planner_reply(conv), failures)
     check("qualitative weeding scope accepted", "how many square" not in reply and "dimensions" not in reply and "lawn size" not in reply and "how big is your lawn" not in reply, failures)
+    check("planner resolves half lawn to 25m2", weeding.get("reference_service") == "lawn_mowing" and weeding.get("reference_area_m2") == 50 and weeding.get("estimated_area_m2") == 25, failures)
 
     result = {"ok": not failures, "failures": failures}
     print(json.dumps(result, indent=2))

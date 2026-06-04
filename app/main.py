@@ -627,6 +627,7 @@ def local_conversation_plan(message: str, state: Optional[asyncpg.Record], known
         "preferred_window": find_window(message),
         "customer_name": extract_name(message) or extract_bare_name(message),
         "missing_fields": [],
+        "service_details": {},
         "reply": reply,
     }
 
@@ -672,6 +673,9 @@ async def conversation_plan(message: str, customer: Optional[asyncpg.Record], st
     if state_obj and isinstance(state_obj.get("missing_fields"), str):
         try: state_obj["missing_fields"] = json.loads(state_obj["missing_fields"])
         except Exception: pass
+    if state_obj and isinstance(state_obj.get("state_json"), str):
+        try: state_obj["state_json"] = json.loads(state_obj["state_json"])
+        except Exception: pass
     system = f"""
 You are the conversation brain for {BUSINESS_NAME}, a local gardening service.
 Return ONLY valid JSON. No markdown.
@@ -696,6 +700,7 @@ Information needed before creating a quote:
   - hedge_trimming: rough hedge length/height
   - garden_clearance: rough size/amount of waste
   - weeding: where the weeding is needed, plus approximate scope as a separate detail. Numeric dimensions are useful, but qualitative scope such as "a few patches", "half the lawn", "the whole lawn", or "all over the borders" is acceptable.
+- Maintain structured service_details for each service. If the customer gives relative scope, resolve it against known service details where possible. Do not invent relative scope: only set "half", "whole", "few patches", etc. when the customer actually says that. Example: if lawn_mowing.area_m2 is 50 and the customer says weeding is "half of the lawn", set weeding.scope_text to "half of the lawn", weeding.reference_service to "lawn_mowing", weeding.reference_area_m2 to 50, and weeding.estimated_area_m2 to 25.
 - If the customer mentions unsupported/non-gardening services (e.g. massage), politely say that part is outside scope and do not include it in workflow services. Continue with valid gardening services if details are sufficient; otherwise ask for missing valid-service details.
 - If the whole request is outside gardening scope, such as building work, loft conversions, extra floors, roof work, car cleaning, pest control, pressure washing, fence repair or tree surgery, route `faq`, explain it is outside scope, and remind them you can help with lawn mowing, hedge trimming, weeding, planting, garden clearance and garden design. Do not route handoff just because the request is outside scope.
 - If the customer makes a nonsense or personal-grooming request involving gardening tools, such as trimming a beard with a lawn mower, route handoff/unsupported and do not treat tool words as gardening services.
@@ -729,6 +734,10 @@ JSON schema:
   "preferred_window":"text or null",
   "customer_name":"name if stated or null",
   "missing_fields":["postcode"],
+  "service_details":{{
+    "lawn_mowing":{{"area_m2":50,"scope_text":"50m2 lawn"}},
+    "weeding":{{"scope_text":"half of the lawn","reference_service":"lawn_mowing","reference_area_m2":50,"estimated_area_m2":25}}
+  }},
   "reply":"customer-facing reply"
 }}
 """
@@ -736,6 +745,7 @@ JSON schema:
         "latest_message": message,
         "known_customer": {"name": customer["name"]} if customer and customer["name"] else {},
         "known_postcode": known_postcode,
+        "known_service_details": (state_obj or {}).get("state_json", {}).get("service_details", {}) if state_obj else {},
         "pending_state": state_obj,
     }, ensure_ascii=False, default=str)
     try:
@@ -880,6 +890,80 @@ def planner_reply(plan: dict, fallback: str = "") -> str:
     if isinstance(reply, str) and reply.strip():
         return reply.strip()
     return fallback
+
+def state_json_obj(state) -> dict:
+    if not state:
+        return {}
+    raw = state["state_json"] if "state_json" in state else {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+def clean_service_details(details: Any) -> dict:
+    if not isinstance(details, dict):
+        return {}
+    allowed_services = set(SERVICES)
+    out = {}
+    for service, values in details.items():
+        if service not in allowed_services or not isinstance(values, dict):
+            continue
+        clean = {}
+        for key, value in values.items():
+            if key in {"area_m2", "estimated_area_m2", "reference_area_m2"}:
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                clean[key] = int(number) if number.is_integer() else number
+            elif key in {"scope_text", "reference_service", "location", "dimensions_text"} and value:
+                clean[key] = str(value)[:160]
+        if clean:
+            out[service] = clean
+    return out
+
+def merge_service_details(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing or {})
+    for service, values in clean_service_details(incoming).items():
+        current = merged.get(service, {})
+        if not isinstance(current, dict):
+            current = {}
+        current.update(values)
+        merged[service] = current
+    return merged
+
+def service_details_summary(details: dict) -> str:
+    parts = []
+    labels = {
+        "area_m2": "area",
+        "estimated_area_m2": "estimated area",
+        "scope_text": "scope",
+        "location": "location",
+        "dimensions_text": "dimensions",
+        "reference_service": "reference service",
+        "reference_area_m2": "reference area",
+    }
+    for service, values in (details or {}).items():
+        if not isinstance(values, dict):
+            continue
+        fragments = []
+        for key, label in labels.items():
+            if key not in values:
+                continue
+            value = values[key]
+            suffix = "m2" if key in {"area_m2", "estimated_area_m2", "reference_area_m2"} else ""
+            fragments.append(f"{label}: {value}{suffix}")
+        if fragments:
+            parts.append(f"{service_label(service)} ({'; '.join(fragments)})")
+    return "; ".join(parts)
+
+def append_service_details_note(text: str, details: dict) -> str:
+    summary = service_details_summary(details)
+    if not summary or summary in text:
+        return text
+    return f"{text}\nStructured service details: {summary}" if text else f"Structured service details: {summary}"
 
 def pending_missing(state) -> list[str]:
     if not state:
@@ -1232,6 +1316,8 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             route = "quote"
         original_message = state["original_message"] if state else redact(msg.message)
         combined_note = original_message if original_message == redact(msg.message) else f"{original_message}\nFollow-up: {redact(msg.message)}"
+        service_details = merge_service_details(state_json_obj(state).get("service_details", {}), plan.get("service_details") or {})
+        combined_note = append_service_details_note(combined_note, service_details)
         if route in {"quote", "booking", "edit"} and not re.search(r"\b(change of plan|actually|instead|rather)\b", combined_note.lower()):
             note_services = find_services(combined_note)
             if state and state["service_type"]:
@@ -1371,7 +1457,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
                 reply = outside_hours_reply() if missing[0] == "preferred date or time" and outside_consultation_hours(plan.get("preferred_window") or find_window(msg.message) or msg.message) else planner_reply(plan, one_at_a_time_reply("booking", missing, unsupported_note))
-                await save_state(con, customer_id, conversation_id, "booking", service, postcode, window, combined_note, missing, state_job_id)
+                await save_state(con, customer_id, conversation_id, "booking", service, postcode, window, combined_note, missing, state_job_id, {"service_details": service_details})
                 return await respond({"ok": True, "route": "booking", "staff_action_required": False, "reply": reply, "missing_fields": missing})
             key = idem(msg, "appointment")
             existing = await con.fetchrow("select id,status from appointments where idempotency_key=$1", key)
@@ -1383,7 +1469,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 jid = state_job_id or await create_job(con, customer_id, conversation_id, service, postcode, combined_note, "initial_consultation")
                 await con.execute("insert into appointments(id,customer_id,job_id,objective,service_type,status,requested_window_text,postcode,customer_notes,idempotency_key) values($1,$2,$3,'initial_consultation',$4,'requested',$5,$6,$7,$8)", aid, customer_id, jid, service, window, postcode, combined_note, key)
                 await audit(con, msg.sender_id, "appointment_request_created", True, None, "appointment", aid)
-                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid}, {"appointment_id": aid, "job_id": jid})
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid, "service_details": service_details}, {"appointment_id": aid, "job_id": jid})
             await clear_state(con, customer_id, conversation_id)
             assumption_text = ASSUMPTION_REPLY_PREFIX + ". " if assumed_detail else ""
             fallback_reply = f"{assumption_text}I’ve created a job and requested an initial consultation for {service_label(service)} for {window} in {postcode}. The team will confirm availability shortly."
@@ -1400,7 +1486,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             state_job_id = state["job_id"] if state and "job_id" in state else None
             if existing_quote and noncommittal_detail_response(msg.message) and not find_services(msg.message) and not find_postcode(msg.message):
                 await update_existing_quote(con, existing_quote, msg.message)
-                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message), "service_details": service_details}, {"quote_request_id": existing_quote["id"]})
                 fallback_reply = f"Thanks — I’ve added that note to your quote request for {service_label(existing_quote['service_type'])} in {existing_quote['postcode']}. The team will use the assumptions already flagged when confirming the final price."
                 return await respond({
                     "ok": True,
@@ -1416,7 +1502,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 missing_for_merged.extend(quote_detail_missing(service, combined_note))
                 if not missing_for_merged and service != existing_quote["service_type"]:
                     await update_quote_work(con, existing_quote, service, combined_note)
-                    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "service_type": service, "postcode": postcode}, {"quote_request_id": existing_quote["id"], "job_id": state_job_id})
+                    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "service_type": service, "postcode": postcode, "service_details": service_details}, {"quote_request_id": existing_quote["id"], "job_id": state_job_id})
                     estimate = quote_estimate(service, find_area_m2(combined_note), combined_note)
                     estimate_text = f" Rough guide: {estimate}." if estimate else ""
                     if existing_consultation and not wants_separate_appointment(msg.message):
@@ -1431,12 +1517,12 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                             "appointment_id": str(existing_consultation["id"]),
                             "reply": planner_reply(plan, fallback_reply),
                         })
-                    await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], state_job_id)
+                    await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], state_job_id, {"service_details": service_details})
                     fallback_reply = f"Thanks — I’ve updated your quote request to include {service_label(service)} in {postcode}.{estimate_text} The best next step is still an initial consultation so the team can confirm the details and final price. Please share a couple of dates/times that work for you."
                     return await respond({"ok": True, "route": "quote_update", "staff_action_required": True, "job_id": str(state_job_id), "quote_request_id": str(existing_quote["id"]), "reply": planner_reply(plan, fallback_reply)})
             if existing_quote and (area_m2 or service == "other" or not postcode):
                 await update_existing_quote(con, existing_quote, msg.message)
-                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message)}, {"quote_request_id": existing_quote["id"]})
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "update_quote_request", {"quote_request_id": existing_quote["id"], "message": redact(msg.message), "service_details": service_details}, {"quote_request_id": existing_quote["id"]})
                 estimate = quote_estimate(existing_quote["service_type"], area_m2, (existing_quote["description"] or "") + "\n" + msg.message)
                 if estimate:
                     reply = f"For {area_m2}m² of {service_label(existing_quote['service_type'])}, a rough guide is {estimate}. I’ve added that detail to your quote request for {existing_quote['postcode']}. The team will still confirm the final price after review."
@@ -1450,18 +1536,18 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
             missing, assumed_detail = assume_repeated_service_detail(state, missing, msg.message)
             combined_note = add_assumption_notes(combined_note, assumed_detail)
             if missing:
-                await save_state(con, customer_id, conversation_id, "quote", service, postcode, window, combined_note, missing)
+                await save_state(con, customer_id, conversation_id, "quote", service, postcode, window, combined_note, missing, state_patch={"service_details": service_details})
                 reply = planner_reply(plan, one_at_a_time_reply("quote", missing, unsupported_note))
                 return await respond({"ok": True, "route": "quote", "staff_action_required": False, "reply": reply, "missing_fields": missing})
             qid = uuid.uuid4(); key=idem(msg,"quote")
             jid = await create_job(con, customer_id, conversation_id, service, postcode, combined_note, "initial_consultation")
             await con.execute("insert into quote_requests(id,customer_id,job_id,service_type,description,postcode,status,idempotency_key) values($1,$2,$3,$4,$5,$6,'new',$7) on conflict (idempotency_key) do nothing", qid, customer_id, jid, service, combined_note, postcode, key)
-            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_quote_request", {"service_type": service, "postcode": postcode, "job_id": jid}, {"quote_request_id": qid, "job_id": jid})
+            await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_quote_request", {"service_type": service, "postcode": postcode, "job_id": jid, "service_details": service_details}, {"quote_request_id": qid, "job_id": jid})
             appointment_id = None
             appointment_text = ""
             if window:
                 if outside_consultation_hours(window):
-                    await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid)
+                    await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid, {"service_details": service_details})
                     return await respond({
                         "ok": True,
                         "route": "booking",
@@ -1473,7 +1559,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                     })
                 appointment_id = uuid.uuid4()
                 await con.execute("insert into appointments(id,customer_id,job_id,objective,service_type,status,requested_window_text,postcode,customer_notes,idempotency_key) values($1,$2,$3,'initial_consultation',$4,'requested',$5,$6,$7,$8) on conflict (idempotency_key) do nothing", appointment_id, customer_id, jid, service, window, postcode, combined_note, idem(msg, "quote-consultation"))
-                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid}, {"appointment_id": appointment_id, "job_id": jid})
+                await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_consultation_request", {"service_type": service, "postcode": postcode, "requested_window_text": window, "job_id": jid, "service_details": service_details}, {"appointment_id": appointment_id, "job_id": jid})
                 appointment_text = f" I’ve also requested an initial consultation for {window}; the team will confirm availability."
             estimate = quote_estimate(service, find_area_m2(combined_note), combined_note)
             estimate_text = f" Rough guide: {estimate}." if estimate else ""
@@ -1487,7 +1573,7 @@ async def process_message(msg: TestMessage, x_gardener_test_secret: str | None =
                 consultation_text = f" There’s already an initial consultation requested for {existing_consultation['requested_window_text']} in {existing_consultation['postcode']}. The team can discuss this at that same consultation."
                 response_appointment_id = existing_consultation["id"]
             else:
-                await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid)
+                await save_state(con, customer_id, conversation_id, "booking", service, postcode, None, combined_note, ["preferred date or time"], jid, {"service_details": service_details})
                 consultation_text = " " + consultation_options_text()
                 response_appointment_id = None
             fallback_reply = f"{assumption_text}Thanks — I’ve created a job and quote request for {service_label(service)} in {postcode}.{estimate_text} The best next step is an initial consultation so the team can confirm the details and final price.{consultation_text}{unsupported_note}"
