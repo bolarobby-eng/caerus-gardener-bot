@@ -4,6 +4,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 
 BASE = "http://100.101.206.14:8788"
@@ -48,7 +49,16 @@ def fail(name, failures):
         raise SystemExit(1)
 
 
+def future_saturday_label(days_ahead=14):
+    day = datetime.now(timezone.utc).date() + timedelta(days=days_ahead)
+    while day.weekday() != 5:
+        day += timedelta(days=1)
+    return day.strftime("%A %d %B")
+
+
 def main():
+    failures = []
+
     sender = f"focus-robert-{RUN}"
     conv = sender + "-conv"
     messages = [
@@ -56,12 +66,10 @@ def main():
         "i've got a lawn that is full of weeds that needs sorting",
         "name is robert johnson. 07815654345 and address is 8 Muirfield Drive, Nottingham, de45gh",
         "i don't need it mowing, i just need the weeds sorting. it's about 10m x 10m",
-        "saturday morning would be best pls",
+        "saturday morning in two weeks would be best pls",
     ]
     responses = [post(sender, conv, message, n) for n, message in enumerate(messages, 1)]
     tr = traces(conv)
-    failures = []
-
     profile_actions = actions_for(tr, f"focus-{RUN}-3")
     profile_changed = [
         call.get("arguments", {}).get("changed_fields", {})
@@ -100,8 +108,39 @@ def main():
     if re.search(r"\blawn\s*mow", latest_reply, re.I):
         failures.append("latest customer reply still asks about lawn mowing")
 
-    fail("Robert name and explicit weeding-only context regression", failures)
-    print(json.dumps({"ok": True, "case_count": 1, "conversation_id": conv}, indent=2))
+    sender = f"focus-bob-{RUN}"
+    conv = sender + "-conv"
+    valid_saturday = future_saturday_label()
+    messages = [
+        "hello",
+        "i'd like to have all my hedges trimmed please",
+        "name is bob jones, phone num 0800 18765432 and postcode is de11sd",
+        "roughly speaking it is about 20m in length and 5m high. i want it cutting down to about 4m",
+        "lets do saturday at 4pm pls",
+        f"lets do {valid_saturday} at 1.30pm",
+    ]
+    responses = [post(sender, conv, message, n + 20) for n, message in enumerate(messages, 1)]
+    tr = traces(conv)
+
+    blocked_reply = responses[4].get("reply", "")
+    if re.search(r"\b(works?\s+(well|for)|is\s+available|confirmed|booked|scheduled)\b", blocked_reply, re.I):
+        failures.append("blocked Saturday 4pm reply incorrectly implied the slot worked")
+    if not re.search(r"\b(10:00|14:00|10am|2pm|weekday|alternative|instead|not available|outside|limited)\b", blocked_reply, re.I):
+        failures.append("blocked Saturday 4pm reply did not explain valid alternatives")
+
+    valid_reply = responses[5].get("reply", "")
+    if re.search(r"\b(let me check|checking availability|i'?ll check)\b", valid_reply, re.I):
+        failures.append("valid Saturday 1:30pm reply left customer waiting on availability check")
+    if not responses[5].get("appointment_id"):
+        failures.append("valid Saturday 1:30pm appointment was not created")
+    final_actions = actions_for(tr, f"focus-{RUN}-26")
+    final_names = [call.get("tool_name") for call in final_actions]
+    for expected in ("get_project_appointments", "check_appointment_availability", "create_appointment"):
+        if expected not in final_names:
+            failures.append(f"valid appointment turn did not execute {expected}")
+
+    fail("Focused v4 regressions", failures)
+    print(json.dumps({"ok": True, "case_count": 2, "conversation_ids": [f"focus-robert-{RUN}-conv", conv]}, indent=2))
 
 
 if __name__ == "__main__":
