@@ -380,44 +380,6 @@ def extract_phone(text: str) -> Optional[str]:
     return re.sub(r"\s+", " ", m.group(0)).strip() if m else None
 
 
-def extract_name(text: str) -> Optional[str]:
-    patterns = [
-        r"\b(?:my name is|name\s+is|name\s*:|i am|i'm|im)\s+([A-Za-z][A-Za-z' -]{1,45})",
-        r"^\s*([A-Za-z][A-Za-z' -]{1,45})\s*,\s*(?=(?:\+?44|0)\s?\d|(?:phone|number|address)\b)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if not m:
-            continue
-        name = re.split(r"\b(?:phone|number|address|postcode|and|with|for)\b|,|\.", m.group(1), maxsplit=1, flags=re.I)[0].strip()
-        if name and name.lower() not in {"customer", "test customer"}:
-            return name.title()
-    return None
-
-
-def extract_bare_name(text: str) -> Optional[str]:
-    if "?" in text or find_postcode(text) or extract_phone(text):
-        return None
-    cleaned = re.sub(r"[^A-Za-z' -]", "", text).strip()
-    if not cleaned or len(cleaned) > 60:
-        return None
-    low = cleaned.lower()
-    greeting_words = {"hi", "hello", "hey", "yo", "hiya", "morning", "there", "again"}
-    blocked = {
-        "yes", "no", "thanks", "thank you", "hi", "hello", "hey", "yo", "hiya",
-        "morning", "good morning", "good afternoon", "postcode", "address", "phone",
-        "hey hey", "hi hi", "hello hello", "hi again", "hello again", "hey again",
-        "hi there", "hello there", "hey there", "what", "what?", "ok", "okay",
-    }
-    if all(word.lower() in greeting_words for word in cleaned.split()):
-        return None
-    if low in blocked or any(w in low for w in ["lawn", "hedge", "garden", "weed", "quote", "book", "mow", "trim"]):
-        return None
-    if 1 <= len(cleaned.split()) <= 4:
-        return cleaned.title()
-    return None
-
-
 def extract_address_line(text: str) -> Optional[str]:
     labelled = re.search(r"\b(?:the address is|address is|address\s*:|i live at|it's at|its at|at)\s+(.+)", text, re.I | re.S)
     candidate = labelled.group(1) if labelled else text
@@ -426,6 +388,21 @@ def extract_address_line(text: str) -> Optional[str]:
     if m:
         return m.group(1).strip().title()
     return None
+
+
+def clean_planner_name(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    name = re.sub(r"\s+", " ", value).strip()
+    if not name or len(name) > 80:
+        return None
+    if re.search(r"[\d@:/\\]", name):
+        return None
+    if name.lower() in {"customer", "test customer", "unknown", "none", "n/a"}:
+        return None
+    if not re.search(r"[A-Za-z]", name):
+        return None
+    return name.title()
 
 
 def services_in(text: str) -> list[str]:
@@ -795,12 +772,14 @@ async def latest_postcode(con, customer_id) -> Optional[str]:
     )
 
 
-async def upsert_profile(con, msg: TestMessage, customer, conversation_id: str, provider_message_id: str):
+async def upsert_profile(con, msg: TestMessage, customer, conversation_id: str, provider_message_id: str, planner_args: dict[str, Any]):
     changed = {}
-    name = extract_name(msg.message) or (extract_bare_name(msg.message) if not customer["name"] else None) or msg.sender_name
-    phone = extract_phone(msg.message)
-    postcode = find_postcode(msg.message)
-    address_line = extract_address_line(msg.message)
+    name = clean_planner_name(planner_args.get("name") or planner_args.get("customer_name") or msg.sender_name)
+    phone = planner_args.get("contact_phone") or planner_args.get("phone") or extract_phone(msg.message)
+    postcode = planner_args.get("postcode") or planner_args.get("known_postcode") or find_postcode(msg.message)
+    postcode = format_postcode(str(postcode)) if postcode else None
+    address_line = planner_args.get("address_line") or planner_args.get("address") or extract_address_line(msg.message)
+    address_line = str(address_line).strip()[:220] if address_line else None
     if name and name != customer["name"]:
         changed["name"] = name
     if phone and phone != customer["contact_phone"]:
@@ -1006,7 +985,7 @@ def backend_observations(msg: TestMessage, state: Optional[asyncpg.Record], cont
     ] if state else []
     return {
         "possible_profile_fields": {
-            "name": extract_name(msg.message) or extract_bare_name(msg.message),
+            "name": None,
             "contact_phone": extract_phone(msg.message),
             "postcode": find_postcode(msg.message),
             "address_line": extract_address_line(msg.message),
@@ -1253,6 +1232,7 @@ Planning rules:
 - A plain greeting is identify_customer, tool_actions: [], no forced name/phone/address intake, warm lightweight opener.
 - FAQ and pure out_of_scope use tool_actions: [] and create no workflow records.
 - If the customer gives any name, phone, postcode, address, or corrected contact/location detail, request upsert_customer_profile with those changed fields. This includes postcode-only messages.
+- The backend does not parse customer names from raw text. When a customer gives a name, you must put that exact name in upsert_customer_profile.args.name.
 - If a supported work request has enough customer/location/service scope, request the complete project workflow actions in the same plan: create_project or update_project, add_project_job or update_project_job for every supported service, upsert_indicative_estimate, and get_project_summary.
 - A missing appointment window must not block project/job/indicative-estimate creation. Create the valid project records first, then ask naturally for dates/times in your reply and set appointment_required true.
 - If work intent exists but key details are missing, ask one natural follow-up and return tool_actions: [] for the missing workflow work.
@@ -1506,7 +1486,11 @@ async def handle_message(msg: TestMessage):
 
         changed_fields = {}
         if "upsert_customer_profile" in planned:
-            customer, changed_fields = await upsert_profile(con, msg, customer, conversation_id, provider_message_id)
+            profile_action = next((action for action in plan["tool_actions"] if action["name"] == "upsert_customer_profile"), None)
+            planner_profile_args = dict(plan.get("customer_updates") or {})
+            if profile_action and isinstance(profile_action.get("args"), dict):
+                planner_profile_args.update(profile_action["args"])
+            customer, changed_fields = await upsert_profile(con, msg, customer, conversation_id, provider_message_id, planner_profile_args)
             known_postcode = find_postcode(msg.message) or await latest_postcode(con, customer["id"]) or known_postcode
             context = await latest_context(con, customer["id"], conversation_id)
 
