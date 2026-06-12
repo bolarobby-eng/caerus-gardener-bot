@@ -18,7 +18,7 @@ TEST_WEBHOOK_SECRET = os.environ["TEST_WEBHOOK_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 ANTHROPIC_MODEL_FAST = os.getenv("ANTHROPIC_MODEL_FAST", "claude-haiku-4-5-20251001")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "Caerus Gardener Bot")
-BUSINESS_PACK_VERSION = "2026-06-11.mock-1"
+BUSINESS_PACK_VERSION = "2026-06-12.mock-2"
 TENANT_ID = "caerus_gardener_demo"
 
 CANONICAL_ROUTES = {
@@ -78,6 +78,67 @@ BUSINESS_PACK = {
     "timezone": "Europe/London",
     "currency": "GBP",
     "appointment_objectives": ["initial_consultation", "work_visit", "follow_up"],
+    "service_detail_schemas": {
+        "lawn_mowing": {
+            "required_any": ["area_m2", "lawn_size", "scope_text"],
+            "recommended": ["lawn_condition", "access_notes", "frequency"],
+            "examples": ["small/medium/large lawn", "80m2 lawn", "long or overgrown grass"],
+        },
+        "hedge_trimming": {
+            "required_any": ["length_m", "scope_text"],
+            "recommended": ["current_height_m", "target_height_m", "access_notes", "waste_handling"],
+            "examples": ["20m long and 5m high, cut down to 4m"],
+        },
+        "weeding": {
+            "required_any": ["estimated_area_m2", "scope_text"],
+            "recommended": ["weed_density", "location_in_garden", "access_notes"],
+            "examples": ["10m x 10m", "few patches in front bed"],
+        },
+        "planting": {
+            "required_any": ["planting_type", "quantity", "scope_text"],
+            "recommended": ["bed_area_m2", "plant_supply", "soil_condition"],
+            "examples": ["plant 12 shrubs", "replant two borders"],
+        },
+        "garden_clearance": {
+            "required_any": ["estimated_area_m2", "waste_volume", "scope_text"],
+            "recommended": ["waste_type", "access_notes", "heavy_items"],
+            "examples": ["clear 20m2 overgrown area", "remove green waste bags"],
+        },
+        "garden_design": {
+            "required_any": ["design_goals", "scope_text"],
+            "recommended": ["garden_area_m2", "style_preferences", "budget_range"],
+            "examples": ["low-maintenance redesign", "patio and planting plan"],
+        },
+    },
+    "appointment_length_rules": {
+        "initial_consultation": {
+            "default_minutes": 30,
+            "by_service": {
+                "lawn_mowing": 30,
+                "hedge_trimming": 30,
+                "weeding": 30,
+                "planting": 45,
+                "garden_clearance": 45,
+                "garden_design": 60,
+            },
+            "multi_service_extra_minutes": 15,
+            "max_minutes": 90,
+        },
+        "work_visit": {
+            "default_minutes": 120,
+            "by_service": {
+                "lawn_mowing": 60,
+                "hedge_trimming": 180,
+                "weeding": 120,
+                "planting": 180,
+                "garden_clearance": 240,
+                "garden_design": 90,
+            },
+            "multi_service_extra_minutes": 30,
+            "max_minutes": 480,
+        },
+        "follow_up": {"default_minutes": 30, "by_service": {}, "multi_service_extra_minutes": 0, "max_minutes": 60},
+    },
     "opening_hours": {
         "monday": [{"start": "09:00", "end": "17:00"}],
         "tuesday": [{"start": "09:00", "end": "17:00"}],
@@ -467,15 +528,16 @@ def blocked_window(window: Optional[dict[str, Any]]) -> Optional[str]:
     start = window_start(window)
     if not start:
         return "Appointment window must include timezone, start, and end"
+    end = window_end(window) or start
     if "sunday" in raw or start.weekday() == 6:
         return "No Sunday appointments"
     if "evening" in raw or start.hour >= 17:
         return "No evening appointments after 17:00"
     if start < utcnow() + timedelta(hours=24):
         return "Minimum 24 hours notice"
-    if start.weekday() == 5 and not (10 <= start.hour < 14):
+    if start.weekday() == 5 and not (10 <= start.hour and (end.hour, end.minute) <= (14, 0)):
         return "Saturday appointments are limited to 10:00-14:00"
-    if start.weekday() < 5 and not (9 <= start.hour < 17):
+    if start.weekday() < 5 and not (9 <= start.hour and (end.hour, end.minute) <= (17, 0)):
         return "Weekday appointments are 09:00-17:00"
     return None
 
@@ -489,23 +551,63 @@ def window_start(window: Optional[dict[str, Any]]) -> Optional[datetime]:
     return start
 
 
-def window_label(window: dict[str, Any]) -> str:
-    start = window_start(window)
+def window_end(window: Optional[dict[str, Any]]) -> Optional[datetime]:
+    if not window or not window.get("end"):
+        return None
     end = datetime.fromisoformat(window["end"])
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
+    return end
+
+
+def minutes_between(start: datetime, end: datetime) -> int:
+    return max(1, int((end - start).total_seconds() // 60))
+
+
+def window_label(window: dict[str, Any]) -> str:
+    start = window_start(window)
+    end = window_end(window)
     if not start:
         return "available slot"
+    if not end:
+        end = start + timedelta(minutes=30)
     return f"{start.strftime('%A %d %B')} {start.strftime('%H:%M')}-{end.strftime('%H:%M')}"
 
 
-def appointment_alternatives() -> list[dict[str, Any]]:
+def appointment_duration_minutes(services: list[str], objective: str = "initial_consultation") -> int:
+    rules = BUSINESS_PACK["appointment_length_rules"].get(objective) or BUSINESS_PACK["appointment_length_rules"]["initial_consultation"]
+    service_durations = [rules.get("by_service", {}).get(service, rules["default_minutes"]) for service in services]
+    base = max(service_durations or [rules["default_minutes"]])
+    extra = max(0, len(set(services)) - 1) * int(rules.get("multi_service_extra_minutes", 0))
+    return min(int(rules.get("max_minutes", base + extra)), base + extra)
+
+
+def apply_appointment_duration(window: dict[str, Any], services: list[str], objective: str = "initial_consultation") -> dict[str, Any]:
+    start = window_start(window)
+    if not start:
+        return window
+    duration = appointment_duration_minutes(services, objective)
+    adjusted = dict(window)
+    adjusted["end"] = (start + timedelta(minutes=duration)).isoformat()
+    adjusted["duration_minutes"] = duration
+    adjusted["objective"] = objective
+    adjusted["label"] = window_label(adjusted)
+    return adjusted
+
+
+def appointment_alternatives(duration_minutes: int = 30, objective: str = "initial_consultation") -> list[dict[str, Any]]:
     out = []
     day = utcnow() + timedelta(days=2)
     while len(out) < 3:
         if day.weekday() < 5:
             start = day.replace(hour=10 if len(out) % 2 == 0 else 14, minute=0, second=0, microsecond=0)
-            window = {"timezone": "Europe/London", "start": start.isoformat(), "end": (start + timedelta(hours=1)).isoformat()}
+            window = {
+                "timezone": "Europe/London",
+                "start": start.isoformat(),
+                "end": (start + timedelta(minutes=duration_minutes)).isoformat(),
+                "duration_minutes": duration_minutes,
+                "objective": objective,
+            }
             window["label"] = window_label(window)
             out.append(window)
         day += timedelta(days=1)
@@ -540,6 +642,19 @@ def unsupported_lawn_scope_assumption(service_detail: dict[str, Any], latest_mes
     if "medium-sized lawn" in scope_text and not mentions_lawn_size:
         return True
     if "good condition" in scope_text and not mentions_lawn_condition:
+        return True
+    return False
+
+
+def has_grounded_lawn_scope(service_detail: dict[str, Any], latest_message: str) -> bool:
+    if service_detail.get("area_m2") or service_detail.get("estimated_area_m2"):
+        return True
+    latest = latest_message.lower()
+    size_value = str(service_detail.get("lawn_size") or service_detail.get("size") or "").lower()
+    if size_value and re.search(r"\b(small|medium|large|tiny|big|huge)\b", latest):
+        return True
+    scope_text = str(service_detail.get("scope") or service_detail.get("scope_text") or "").lower()
+    if scope_text and re.search(r"\b(small|medium|large|tiny|big|huge|m2|m²|metres?|meters?|sqm|square|x|long|overgrown|patchy)\b", scope_text):
         return True
     return False
 
@@ -731,7 +846,7 @@ def missing_for_project(customer, postcode: Optional[str], services: list[str], 
         missing.append("supported_service")
     for service in services:
         service_detail = details.get(service, {})
-        if service == "lawn_mowing" and not (service_detail.get("area_m2") or service_detail.get("scope_text") or service_detail.get("scope")):
+        if service == "lawn_mowing" and not has_grounded_lawn_scope(service_detail, ""):
             missing.append("lawn_mowing.scope")
         if service == "hedge_trimming" and not (service_detail.get("scope_text") or service_detail.get("scope")):
             missing.append("hedge_trimming.scope")
@@ -760,7 +875,7 @@ def unresolved_missing_fields(missing: list[str], customer, postcode: Optional[s
                 continue
         if field == "lawn_mowing.scope":
             lawn = details.get("lawn_mowing", {})
-            if lawn.get("area_m2") or lawn.get("scope_text") or lawn.get("scope"):
+            if has_grounded_lawn_scope(lawn, ""):
                 continue
         if field == "hedge_trimming.scope":
             hedge = details.get("hedge_trimming", {})
@@ -856,6 +971,7 @@ Rules:
 - Do not say "let me check" or imply the customer should wait if check_appointment_availability has already run.
 - If an appointment was created or updated, clearly confirm the slot.
 - If availability was blocked, clearly say the requested slot is not available/allowed and offer the available alternatives from the tool result.
+- Always tell the customer the appointment objective and length when offering or confirming a slot.
 - When offering alternatives, copy the tool result labels exactly. Do not recalculate weekdays or dates yourself.
 - Do not contradict yourself: never say a blocked slot works, is available, or is confirmed.
 - Keep it brief and human.
@@ -1089,10 +1205,11 @@ def planner_contract_errors(plan: dict[str, Any], context: dict[str, Any], obser
     if {"create_project", "add_project_job", "update_project_job", "upsert_indicative_estimate"} & names:
         for service in services:
             service_detail = (plan.get("service_details") or {}).get(service, {})
-            has_scope = bool(
-                isinstance(service_detail, dict)
-                and (service_detail.get("scope") or service_detail.get("scope_text") or service_detail.get("area_m2") or service_detail.get("estimated_area_m2"))
-            )
+            has_scope = bool(isinstance(service_detail, dict) and (
+                has_grounded_lawn_scope(service_detail, latest_message)
+                if service == "lawn_mowing"
+                else (service_detail.get("scope") or service_detail.get("scope_text") or service_detail.get("area_m2") or service_detail.get("estimated_area_m2"))
+            ))
             if not has_scope:
                 errors.append(f"Planner requested workflow actions for {service} but did not provide service_details.{service}.scope/scope_text/area.")
             if service == "lawn_mowing" and service not in active_services and unsupported_lawn_scope_assumption(service_detail, latest_message):
@@ -1213,6 +1330,9 @@ Planning rules:
 - A plain greeting is identify_customer, tool_actions: [], no forced name/phone/address intake, warm lightweight opener.
 - FAQ and pure out_of_scope use tool_actions: [] and create no workflow records.
 - The backend does not parse normal customer data from raw text. You must extract profile fields, service intent, service exclusions, service scope, and requested appointment windows from the customer message and conversation state.
+- Use business_pack.service_detail_schemas to decide what details are needed for each job type. Gather as many stated details as possible. If the customer does not know, ask for photos where useful so details can be estimated from media.
+- Use business_pack.appointment_length_rules when discussing appointment length. Appointment plans must have an objective such as initial_consultation, work_visit, or follow_up.
+- Before a staff-confirmed/accepted final estimate, the normal appointment objective is initial_consultation. Do not call it a work_visit just because the customer is choosing a time after an indicative estimate.
 - If the customer gives any name, phone, postcode, address, or corrected contact/location detail, request upsert_customer_profile with those changed fields in tool_actions[].args. This includes postcode-only messages.
 - When a customer gives a name, put that exact name in upsert_customer_profile.args.name. When they give phone/postcode/address, put them in contact_phone/postcode/address_line.
 - If a supported work request has enough customer/location/service scope, request the complete project workflow actions in the same plan: create_project or update_project, add_project_job or update_project_job for every supported service, upsert_indicative_estimate, and get_project_summary.
@@ -1225,6 +1345,8 @@ Planning rules:
 - If a project exists and the customer asks status/summary, request get_project_summary.
 - Appointment creation/reschedule must request get_project_appointments, check_appointment_availability, and then create_appointment or update_appointment when the requested window is concrete.
 - Every check_appointment_availability action must have a top-level requested_window object with timezone, start, end, and raw_customer_text. Do not put the only appointment time inside tool_actions[].args as free text.
+- Include an appointment objective in check_appointment_availability.args.objective. Initial consultations are generally used before staff confirm final pricing/work visits.
+- Advise the customer of appointment length when booking or offering appointment slots.
 - If a customer gives a supported service and a concrete appointment window in the same message, request the project/job/estimate actions and the appointment sequence in the same plan.
 - Invalid Sunday, evening, too-soon, or blocked booking windows are appointment_management with check_appointment_availability. They are not hard_invariant and do not require create_staff_handoff.
 - Never say a requested slot "works", is "available", or is "confirmed" until availability has been checked and the appointment action can complete. If the slot is outside business rules, state that directly and offer valid alternatives; do not say it works and then contradict yourself.
@@ -1380,25 +1502,35 @@ async def get_project_appointments(con, customer_id, conversation_id: str, provi
     return rows
 
 
-async def check_availability(con, customer_id, conversation_id: str, provider_message_id: str, project_id, window: dict[str, Any], objective: str):
+async def check_availability(con, customer_id, conversation_id: str, provider_message_id: str, project_id, window: dict[str, Any], objective: str, services: list[str]):
+    window = apply_appointment_duration(window, services, objective)
     reason = blocked_window(window)
     check_id = "avail_" + hashlib.sha1(json.dumps(window, sort_keys=True).encode()).hexdigest()[:12]
-    result = {"availability_check_id": check_id, "allowed": reason is None, "reason": reason or "available", "available_alternatives": appointment_alternatives() if reason else []}
-    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "check_appointment_availability", {"project_id": project_id, "requested_window": window, "objective": objective}, result)
+    duration = int(window.get("duration_minutes") or appointment_duration_minutes(services, objective))
+    result = {
+        "availability_check_id": check_id,
+        "allowed": reason is None,
+        "reason": reason or "available",
+        "requested_window": window,
+        "appointment_objective": objective,
+        "duration_minutes": duration,
+        "available_alternatives": appointment_alternatives(duration, objective) if reason else [],
+    }
+    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "check_appointment_availability", {"project_id": project_id, "requested_window": window, "objective": objective, "duration_minutes": duration}, result)
     if reason:
         await audit(con, str(customer_id), "booking_rule_block", False, reason, "project", project_id, {"window": window, "business_pack_version": BUSINESS_PACK_VERSION})
     return result
 
 
-async def create_appointment(con, customer_id, conversation_id: str, provider_message_id: str, project_id, job_ids: list[Any], window: dict[str, Any], availability_check_id: str, msg: TestMessage):
+async def create_appointment(con, customer_id, conversation_id: str, provider_message_id: str, project_id, job_ids: list[Any], window: dict[str, Any], availability_check_id: str, msg: TestMessage, objective: str):
     existing = await con.fetchrow("select * from appointments_v4 where project_id=$1 and lifecycle_state in ('scheduled','proposed') order by created_at desc limit 1", project_id)
     if existing and not re.search(r"\b(separate|another|second)\b", msg.message.lower()):
-        await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_appointment", {"project_id": project_id, "objective": "initial_consultation", "window": window, "availability_check_id": availability_check_id, "source_message_id": provider_message_id}, {"appointment_id": existing["id"], "lifecycle_state": existing["lifecycle_state"], "project_appointment_state": "scheduled"}, status="skipped", key=idempotency_key(msg, "create_appointment"))
+        await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_appointment", {"project_id": project_id, "objective": objective, "window": window, "availability_check_id": availability_check_id, "source_message_id": provider_message_id, "duration_minutes": window.get("duration_minutes")}, {"appointment_id": existing["id"], "lifecycle_state": existing["lifecycle_state"], "project_appointment_state": "scheduled"}, status="skipped", key=idempotency_key(msg, "create_appointment"))
         return existing
     aid = uuid.uuid4()
-    await con.execute("insert into appointments_v4(id,project_id,objective,lifecycle_state,appointment_window,availability_check_id,source_message_id) values($1,$2,'initial_consultation','scheduled',$3::jsonb,$4,$5)", aid, project_id, json.dumps(window), availability_check_id, provider_message_id)
+    await con.execute("insert into appointments_v4(id,project_id,objective,lifecycle_state,appointment_window,availability_check_id,source_message_id) values($1,$2,$3,'scheduled',$4::jsonb,$5,$6)", aid, project_id, objective, json.dumps(window), availability_check_id, provider_message_id)
     await con.execute("update projects_v4 set appointment_state='scheduled', updated_at=now() where id=$1", project_id)
-    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_appointment", {"project_id": project_id, "objective": "initial_consultation", "window": window, "availability_check_id": availability_check_id, "source_message_id": provider_message_id, "job_ids": job_ids}, {"appointment_id": aid, "lifecycle_state": "scheduled", "project_appointment_state": "scheduled"}, key=idempotency_key(msg, "create_appointment"))
+    await record_tool_call(con, customer_id, conversation_id, provider_message_id, "create_appointment", {"project_id": project_id, "objective": objective, "window": window, "availability_check_id": availability_check_id, "source_message_id": provider_message_id, "job_ids": job_ids, "duration_minutes": window.get("duration_minutes")}, {"appointment_id": aid, "lifecycle_state": "scheduled", "project_appointment_state": "scheduled", "duration_minutes": window.get("duration_minutes")}, key=idempotency_key(msg, "create_appointment"))
     return await con.fetchrow("select * from appointments_v4 where id=$1", aid)
 
 
@@ -1583,6 +1715,17 @@ async def handle_message(msg: TestMessage):
 
         appointment_state = project["appointment_state"] if project else "needed"
         appointment_id = None
+        appointment_objective = "initial_consultation"
+        check_action = next((action for action in plan["tool_actions"] if action.get("name") == "check_appointment_availability"), None)
+        if check_action and isinstance(check_action.get("args"), dict):
+            proposed_objective = str(check_action["args"].get("objective") or appointment_objective)
+            if proposed_objective in BUSINESS_PACK["appointment_objectives"]:
+                appointment_objective = proposed_objective
+        has_accepted_estimate = any(str(row.get("lifecycle_state")) == "accepted" for row in context.get("estimates", []))
+        if appointment_objective == "work_visit" and not has_accepted_estimate:
+            appointment_objective = "initial_consultation"
+        if window:
+            window = apply_appointment_duration(window, services, appointment_objective)
 
         if project and appointment_declined:
             appointment_state = "deferred_by_customer" if "later" in msg.message.lower() or "defer" in msg.message.lower() else "declined_by_customer"
@@ -1597,15 +1740,16 @@ async def handle_message(msg: TestMessage):
                 await record_tool_call(con, customer["id"], conversation_id, provider_message_id, "cancel_appointment", {"appointment_id": appt["id"], "reason": "customer requested cancellation", "source_message_id": provider_message_id}, {"appointment_id": appt["id"], "lifecycle_state": "cancelled", "project_appointment_state": "cancelled"}, key=idempotency_key(msg, "cancel_appointment"))
                 appointment_state = "cancelled"
             elif window and "check_appointment_availability" in planned:
-                availability = await check_availability(con, customer["id"], conversation_id, provider_message_id, project["id"], window, "initial_consultation")
+                availability = await check_availability(con, customer["id"], conversation_id, provider_message_id, project["id"], window, appointment_objective, services)
+                window = availability.get("requested_window") or window
                 if availability["allowed"]:
                     if "update_appointment" in planned and appointments:
                         appt = appointments[0]
                         await con.execute("update appointments_v4 set appointment_window=$1::jsonb, availability_check_id=$2, lifecycle_state='scheduled', updated_at=now() where id=$3", json.dumps(window), availability["availability_check_id"], appt["id"])
-                        await record_tool_call(con, customer["id"], conversation_id, provider_message_id, "update_appointment", {"appointment_id": appt["id"], "changed_fields": {"window": window}, "availability_check_id": availability["availability_check_id"], "source_message_id": provider_message_id}, {"appointment_id": appt["id"], "lifecycle_state": "scheduled", "changed_fields": ["window"]}, key=idempotency_key(msg, "update_appointment"))
+                        await record_tool_call(con, customer["id"], conversation_id, provider_message_id, "update_appointment", {"appointment_id": appt["id"], "changed_fields": {"window": window}, "availability_check_id": availability["availability_check_id"], "source_message_id": provider_message_id, "duration_minutes": window.get("duration_minutes")}, {"appointment_id": appt["id"], "lifecycle_state": "scheduled", "changed_fields": ["window"], "duration_minutes": window.get("duration_minutes")}, key=idempotency_key(msg, "update_appointment"))
                         appointment_id = appt["id"]
                     elif "create_appointment" in planned:
-                        appt = await create_appointment(con, customer["id"], conversation_id, provider_message_id, project["id"], job_ids, window, availability["availability_check_id"], msg)
+                        appt = await create_appointment(con, customer["id"], conversation_id, provider_message_id, project["id"], job_ids, window, availability["availability_check_id"], msg, appointment_objective)
                         appointment_id = appt["id"]
                     appointment_state = "scheduled"
                 else:

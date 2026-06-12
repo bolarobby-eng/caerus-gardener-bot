@@ -131,6 +131,8 @@ def main():
     valid_reply = responses[5].get("reply", "")
     if re.search(r"\b(let me check|checking availability|i'?ll check)\b", valid_reply, re.I):
         failures.append("valid Saturday 1:30pm reply left customer waiting on availability check")
+    if not re.search(r"\b30[- ]?(minute|minutes|min)\b", valid_reply, re.I):
+        failures.append("confirmed hedge consultation reply did not advise appointment length")
     if not responses[5].get("appointment_id"):
         failures.append("valid Saturday 1:30pm appointment was not created")
     final_actions = actions_for(tr, f"focus-{RUN}-26")
@@ -138,6 +140,9 @@ def main():
     for expected in ("get_project_appointments", "check_appointment_availability", "create_appointment"):
         if expected not in final_names:
             failures.append(f"valid appointment turn did not execute {expected}")
+    create_calls = [call for call in final_actions if call.get("tool_name") == "create_appointment"]
+    if create_calls and create_calls[0].get("arguments", {}).get("duration_minutes") != 30:
+        failures.append("hedge initial consultation did not use 30-minute business-pack duration")
 
     lawn_response = post(sender, conv, "ok i also want to have my lawns done at the same time", 27)
     tr = traces(conv)
