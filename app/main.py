@@ -370,26 +370,6 @@ def format_postcode(postcode: str) -> str:
     return pc[:-3] + " " + pc[-3:] if len(pc) > 3 else pc
 
 
-def find_postcode(text: str) -> Optional[str]:
-    m = re.search(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", text, re.I)
-    return format_postcode(m.group(1)) if m else None
-
-
-def extract_phone(text: str) -> Optional[str]:
-    m = re.search(r"(?:\+?44|0)\s?\d[\d\s-]{8,13}", text)
-    return re.sub(r"\s+", " ", m.group(0)).strip() if m else None
-
-
-def extract_address_line(text: str) -> Optional[str]:
-    labelled = re.search(r"\b(?:the address is|address is|address\s*:|i live at|it's at|its at|at)\s+(.+)", text, re.I | re.S)
-    candidate = labelled.group(1) if labelled else text
-    candidate = re.split(r"\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b", candidate, maxsplit=1, flags=re.I)[0]
-    m = re.search(r"\b(\d{1,5}\s+[A-Za-z0-9' -]{2,70}?\s(?:road|rd|street|st|avenue|ave|lane|ln|drive|close|way|court|gardens|place))\b", candidate, re.I)
-    if m:
-        return m.group(1).strip().title()
-    return None
-
-
 def clean_planner_name(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -405,74 +385,20 @@ def clean_planner_name(value: Any) -> Optional[str]:
     return name.title()
 
 
-def services_in(text: str) -> list[str]:
-    low = text.lower()
-    found: list[str] = []
-    patterns = {
-        "lawn_mowing": [r"\blawn(?:s)?\b", r"\bmow(?:ing|ed)?\b", r"\bgrass\b"],
-        "hedge_trimming": [r"\bhedge(?:s)?\b", r"\btrim(?:ming)?\b"],
-        "weeding": [r"\bweed(?:s|ing)?\b"],
-        "planting": [r"\bplant(?:s|ing)?\b", r"\bshrub(?:s)?\b"],
-        "garden_clearance": [r"\bclearance\b", r"\bclear\b", r"\bovergrown\b", r"\bwaste\b", r"\brubbish\b"],
-        "garden_design": [r"\bdesign\b", r"\blayout\b", r"\blandscap(?:e|ing)\b"],
-    }
-    for service, service_patterns in patterns.items():
-        if any(re.search(pattern, low) for pattern in service_patterns):
-            found.append(service)
-    return list(dict.fromkeys(found))
+def clean_planner_text(value: Any, limit: int = 220) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    text = re.sub(r"\s+", " ", value).strip()
+    return text[:limit] if text else None
 
 
-def excluded_services(text: str) -> list[str]:
-    low = text.lower()
-    excluded: list[str] = []
-    checks = {
-        "lawn_mowing": [
-            r"\b(?:do\s*not|don't|dont|doesn't|does not|no|not|without)\b.{0,45}\b(?:lawn\s*mow(?:ing)?|mow(?:ing)?|grass\s*cut(?:ting)?)\b",
-            r"\b(?:lawn\s*mow(?:ing)?|mow(?:ing)?|grass\s*cut(?:ting)?)\b.{0,45}\b(?:not needed|isn'?t needed|don't need|dont need|not required)\b",
-            r"\bjust\b.{0,25}\b(?:weed(?:s|ing)?|weeds sorting)\b",
-        ],
-        "hedge_trimming": [
-            r"\b(?:do\s*not|don't|dont|no|not|without)\b.{0,45}\b(?:hedge(?:s)?|trim(?:ming)?)\b",
-            r"\bjust\b.{0,25}\b(?:weed(?:s|ing)?|lawn\s*mow(?:ing)?)\b",
-        ],
-    }
-    for service, patterns in checks.items():
-        if any(re.search(pattern, low) for pattern in patterns):
-            excluded.append(service)
-    return excluded
-
-
-def unsupported_in(text: str) -> list[str]:
-    low = text.lower()
-    checks = [
-        ("loft conversion", r"\b(loft conversion|convert.*loft|extension|building work|builder|renovation|roof)\b"),
-        ("car cleaning", r"\b(clean my car|car cleaning|valet)\b"),
-        ("pressure washing", r"\b(pressure wash|pressure washing|jet wash|jet washing)\b"),
-        ("fence repair", r"\b(fence|fencing)\b.{0,35}\b(repair|fix|replace|install|broken)\b|\b(repair|fix|replace|install|broken)\b.{0,35}\b(fence|fencing)\b"),
-        ("tree surgery", r"\b(tree surgery|tree surgeon|fell .*tree|cut down .*tree|remove .*tree)\b"),
-        ("pest control", r"\b(pest control|rats?|mice|wasps?|infestation)\b"),
-        ("personal grooming", r"\b(beard|haircut|massage|back rub)\b"),
-    ]
-    return [label for label, pattern in checks if re.search(pattern, low)]
-
-
-def requested_service_removal(text: str, active_services: list[str]) -> bool:
-    low = text.lower()
-    if re.search(r"\b(change|switch|replace|instead)\b", low):
-        requested = services_in(text)
-        if active_services and any(service not in active_services for service in requested):
-            return True
-    if not re.search(r"\b(remove|cancel|drop|take off|delete)\b", low):
-        return False
-    labels = {
-        "lawn_mowing": [r"\blawn\b", r"\bmow(?:ing)?\b", r"\bgrass\b"],
-        "hedge_trimming": [r"\bhedge\b", r"\btrim(?:ming)?\b"],
-        "weeding": [r"\bweed(?:ing)?\b"],
-        "planting": [r"\bplant(?:ing)?\b", r"\bshrub\b"],
-        "garden_clearance": [r"\bclearance\b", r"\bclear\b"],
-        "garden_design": [r"\bdesign\b"],
-    }
-    return any(any(re.search(pattern, low) for pattern in labels.get(service, [])) for service in active_services)
+def clean_planner_phone(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    phone = re.sub(r"\s+", " ", value).strip()
+    if not phone or len(phone) > 40:
+        return None
+    return phone
 
 
 def is_high_risk(text: str) -> bool:
@@ -502,10 +428,6 @@ def wants_human(text: str) -> bool:
     )
 
 
-def media_intent(text: str) -> bool:
-    return bool(re.search(r"\b(photo|image|picture|pic|attached|upload)\b", text.lower()))
-
-
 def normalized_media(msg: TestMessage, provider_message_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for idx, item in enumerate(msg.media or []):
@@ -524,111 +446,6 @@ def normalized_media(msg: TestMessage, provider_message_id: str) -> list[dict[st
             "caption": redact(msg.message),
         })
     return out
-
-
-def area_m2(text: str) -> Optional[int]:
-    dims = re.search(
-        r"\b(\d{1,4}(?:\.\d+)?)\s*(?:m|metres?|meters?)?\s*(?:x|×|by)\s*(\d{1,4}(?:\.\d+)?)\s*(?:m|metres?|meters?)\b",
-        text,
-        re.I,
-    )
-    if dims:
-        return round(float(dims.group(1)) * float(dims.group(2)))
-    m = re.search(r"\b(\d{1,5})\s*(?:m2|m²|sqm|sq\s*m|square\s*met(?:er|re)s?)\b", text, re.I)
-    return int(m.group(1)) if m else None
-
-
-def service_details(text: str, existing: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
-    existing = existing or {}
-    details = {k: dict(v) for k, v in existing.items() if isinstance(v, dict)}
-    if isinstance(existing.get("__pending_media"), list):
-        details["__pending_media"] = list(existing["__pending_media"])
-    services = services_in(text)
-    low = text.lower()
-    if "lawn_mowing" in services:
-        details.setdefault("lawn_mowing", {})
-        if area_m2(text):
-            details["lawn_mowing"]["area_m2"] = area_m2(text)
-            details["lawn_mowing"]["scope_text"] = f"{area_m2(text)}m2 lawn"
-        elif re.search(r"\b(small|medium|large|tiny|big)\s+(lawn|garden)\b", low):
-            details["lawn_mowing"]["scope_text"] = re.search(r"\b(small|medium|large|tiny|big)\s+(lawn|garden)\b", low).group(0)
-    if "hedge_trimming" in services:
-        details.setdefault("hedge_trimming", {})
-        dims = re.findall(r"\b(\d+(?:\.\d+)?)\s*(?:m|metres?|meters?|ft|feet)\b", low)
-        if dims:
-            details["hedge_trimming"]["scope_text"] = "hedge dimensions " + ", ".join(dims)
-    if "weeding" in services:
-        details.setdefault("weeding", {})
-        if "half" in low and "lawn" in low:
-            lawn_area = details.get("lawn_mowing", {}).get("area_m2")
-            if lawn_area:
-                details["weeding"].update({
-                    "scope_text": "half of the lawn",
-                    "reference_service": "lawn_mowing",
-                    "reference_area_m2": lawn_area,
-                    "estimated_area_m2": lawn_area / 2,
-                })
-        elif area_m2(text):
-            details["weeding"]["estimated_area_m2"] = area_m2(text)
-            dims = re.search(
-                r"\b\d{1,4}(?:\.\d+)?\s*(?:m|metres?|meters?)?\s*(?:x|×|by)\s*\d{1,4}(?:\.\d+)?\s*(?:m|metres?|meters?)\b",
-                text,
-                re.I,
-            )
-            details["weeding"]["scope_text"] = f"{dims.group(0)} weeding area" if dims else f"{area_m2(text)}m2 weeding area"
-        elif re.search(r"\b(few patches|some patches|whole garden|all over|patio|borders?|beds?|driveway|paths?)\b", low):
-            details["weeding"]["scope_text"] = re.search(r"\b(few patches|some patches|whole garden|all over|patio|borders?|beds?|driveway|paths?)\b", low).group(0)
-    if "planting" in services:
-        details.setdefault("planting", {})["scope_text"] = "planting request"
-    if "garden_clearance" in services:
-        details.setdefault("garden_clearance", {})["scope_text"] = "garden clearance request"
-    if "garden_design" in services:
-        details.setdefault("garden_design", {})["scope_text"] = "garden design consultation"
-    return details
-
-
-def window_from_text(text: str) -> Optional[dict[str, Any]]:
-    low = text.lower()
-    if not re.search(r"\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next week|morning|afternoon|evening|\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", low):
-        return None
-    raw = re.search(r"\b(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+(?:morning|afternoon|evening|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)))?|tomorrow(?:\s+(?:morning|afternoon|evening))?|next week|(?:morning|afternoon|evening)|\d{1,2}(?::\d{2})?\s*(?:am|pm)\b", low)
-    raw_text = raw.group(0) if raw else text[:80]
-    now = utcnow()
-    start = now + timedelta(days=2)
-    preferred_day = None
-    for idx, day in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]):
-        if day in raw_text:
-            preferred_day = idx
-            break
-    if preferred_day is not None:
-        delta = (preferred_day - start.weekday()) % 7
-        if "next " in raw_text and delta == 0:
-            delta = 7
-        start = start + timedelta(days=delta)
-    hour = 10
-    if "afternoon" in raw_text:
-        hour = 14
-    if "evening" in raw_text:
-        hour = 19
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)", raw_text)
-    minute = 0
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2) or 0)
-        if m.group(3) == "pm" and hour != 12:
-            hour += 12
-        if m.group(3) == "am" and hour == 12:
-            hour = 0
-    start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    end = start + timedelta(hours=1)
-    return {
-        "timezone": "Europe/London",
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "raw_customer_text": raw_text,
-        "date_precision": "candidate",
-        "preferred_day_part": "evening" if hour >= 17 else "afternoon" if hour >= 12 else "morning",
-    }
 
 
 def blocked_window(window: Optional[dict[str, Any]]) -> Optional[str]:
@@ -774,12 +591,11 @@ async def latest_postcode(con, customer_id) -> Optional[str]:
 
 async def upsert_profile(con, msg: TestMessage, customer, conversation_id: str, provider_message_id: str, planner_args: dict[str, Any]):
     changed = {}
-    name = clean_planner_name(planner_args.get("name") or planner_args.get("customer_name") or msg.sender_name)
-    phone = planner_args.get("contact_phone") or planner_args.get("phone") or extract_phone(msg.message)
-    postcode = planner_args.get("postcode") or planner_args.get("known_postcode") or find_postcode(msg.message)
-    postcode = format_postcode(str(postcode)) if postcode else None
-    address_line = planner_args.get("address_line") or planner_args.get("address") or extract_address_line(msg.message)
-    address_line = str(address_line).strip()[:220] if address_line else None
+    name = clean_planner_name(planner_args.get("name") or planner_args.get("customer_name"))
+    phone = clean_planner_phone(planner_args.get("contact_phone") or planner_args.get("phone"))
+    postcode = clean_planner_text(planner_args.get("postcode") or planner_args.get("known_postcode"), 20)
+    postcode = format_postcode(postcode) if postcode else None
+    address_line = clean_planner_text(planner_args.get("address_line") or planner_args.get("address"), 220)
     if name and name != customer["name"]:
         changed["name"] = name
     if phone and phone != customer["contact_phone"]:
@@ -859,11 +675,11 @@ def missing_for_project(customer, postcode: Optional[str], services: list[str], 
         missing.append("supported_service")
     for service in services:
         service_detail = details.get(service, {})
-        if service == "lawn_mowing" and not (service_detail.get("area_m2") or service_detail.get("scope_text")):
+        if service == "lawn_mowing" and not (service_detail.get("area_m2") or service_detail.get("scope_text") or service_detail.get("scope")):
             missing.append("lawn_mowing.scope")
-        if service == "hedge_trimming" and not service_detail.get("scope_text"):
+        if service == "hedge_trimming" and not (service_detail.get("scope_text") or service_detail.get("scope")):
             missing.append("hedge_trimming.scope")
-        if service == "weeding" and not service_detail.get("scope_text") and not service_detail.get("estimated_area_m2"):
+        if service == "weeding" and not service_detail.get("scope_text") and not service_detail.get("estimated_area_m2") and not service_detail.get("scope"):
             missing.append("weeding.scope")
     return missing
 
@@ -978,28 +794,23 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 def backend_observations(msg: TestMessage, state: Optional[asyncpg.Record], context: dict[str, Any], existing_details: dict[str, Any], inbound_media: list[dict[str, Any]]) -> dict[str, Any]:
     pending_media = existing_details.get("__pending_media") if isinstance(existing_details.get("__pending_media"), list) else []
-    excluded = excluded_services(msg.message)
-    state_services = [
-        service for service in state_json(state).get("services", [])
-        if service not in excluded
-    ] if state else []
     return {
         "possible_profile_fields": {
             "name": None,
-            "contact_phone": extract_phone(msg.message),
-            "postcode": find_postcode(msg.message),
-            "address_line": extract_address_line(msg.message),
+            "contact_phone": None,
+            "postcode": None,
+            "address_line": None,
         },
-        "possible_supported_services": services_in(msg.message),
-        "possible_unsupported_services": unsupported_in(msg.message),
-        "possible_service_details": service_details(msg.message, existing_details),
-        "possible_requested_window": window_from_text(msg.message),
+        "possible_supported_services": [],
+        "possible_unsupported_services": [],
+        "possible_service_details": existing_details,
+        "possible_requested_window": None,
         "media": inbound_media,
         "pending_media": pending_media,
         "has_active_project": bool(context.get("project")),
         "active_services": [j["service_key"] for j in context.get("jobs") or []],
-        "explicitly_excluded_services": excluded,
-        "state_services_after_exclusions": state_services,
+        "explicitly_excluded_services": [],
+        "state_services_after_exclusions": state_json(state).get("services", []) if state else [],
         "pending_state": state_json(state),
         "missing_fields_from_previous_turn": state_missing(state),
     }
@@ -1052,10 +863,19 @@ def normalise_planner_plan(raw: dict[str, Any], msg: TestMessage, observations: 
         actions.append(clean)
 
     services = [s for s in raw.get("services", []) if s in SUPPORTED_SERVICES] if isinstance(raw.get("services"), list) else []
-    excluded = set(observations.get("explicitly_excluded_services") or [])
+    excluded = {
+        service for service in raw.get("excluded_services", [])
+        if service in SUPPORTED_SERVICES
+    } if isinstance(raw.get("excluded_services"), list) else set()
     services = [service for service in services if service not in excluded]
     details = raw.get("service_details") if isinstance(raw.get("service_details"), dict) else {}
-    validated_details = service_details(msg.message, details)
+    validated_details = {
+        service: dict(value)
+        for service, value in details.items()
+        if service in SUPPORTED_SERVICES and isinstance(value, dict)
+    }
+    if isinstance(details.get("__pending_media"), list):
+        validated_details["__pending_media"] = list(details["__pending_media"])
     for key, value in details.items():
         if key in SUPPORTED_SERVICES and isinstance(value, dict):
             validated_details.setdefault(key, {}).update(value)
@@ -1078,7 +898,7 @@ def normalise_planner_plan(raw: dict[str, Any], msg: TestMessage, observations: 
         and preferred_window.get("start")
         and preferred_window.get("end")
     ):
-        preferred_window = observations.get("possible_requested_window")
+        preferred_window = None
 
     return {
         "planner_authored": True,
@@ -1089,8 +909,9 @@ def normalise_planner_plan(raw: dict[str, Any], msg: TestMessage, observations: 
         "appointment_declined": bool(raw.get("appointment_declined")),
         "tool_actions": actions,
         "services": services,
+        "excluded_services": sorted(excluded),
         "service_details": validated_details,
-        "postcode": raw.get("postcode") or observations.get("possible_profile_fields", {}).get("postcode"),
+        "postcode": raw.get("postcode"),
         "preferred_window": raw.get("preferred_window") or (preferred_window or {}).get("raw_customer_text") if isinstance(preferred_window, dict) else raw.get("preferred_window"),
         "requested_window": preferred_window,
         "customer_updates": raw.get("customer_updates") if isinstance(raw.get("customer_updates"), dict) else {},
@@ -1107,35 +928,44 @@ def planner_contract_errors(plan: dict[str, Any], context: dict[str, Any], obser
     errors: list[str] = []
     names = {a.get("name") for a in plan.get("tool_actions", [])}
     route = plan.get("route")
-    profile = observations.get("possible_profile_fields") or {}
-    has_profile_detail = any(profile.get(k) for k in ("name", "contact_phone", "postcode", "address_line"))
+    profile_updates = plan.get("customer_updates") if isinstance(plan.get("customer_updates"), dict) else {}
+    profile_action_args = {}
+    for action in plan.get("tool_actions", []):
+        if action.get("name") == "upsert_customer_profile" and isinstance(action.get("args"), dict):
+            profile_action_args.update(action["args"])
+    has_profile_detail = any(
+        (profile_updates.get(k) or profile_action_args.get(k))
+        for k in ("name", "customer_name", "contact_phone", "phone", "postcode", "known_postcode", "address_line", "address")
+    )
     has_project = bool(context.get("project"))
     services = plan.get("services") or []
     requested_window = plan.get("requested_window")
     has_window = isinstance(requested_window, dict) and requested_window.get("start") and requested_window.get("end")
     latest_message = observations.get("latest_message", "")
     hard_boundary_message = is_high_risk(latest_message) or is_data_rights(latest_message) or wants_human(latest_message)
-    has_location = bool(plan.get("postcode") or profile.get("postcode") or context.get("project"))
+    has_location = bool(plan.get("postcode") or profile_updates.get("postcode") or profile_action_args.get("postcode") or context.get("project"))
     has_service_scope = bool(plan.get("service_details"))
-    latest_supplies_work_scope = bool(observations.get("possible_supported_services"))
+    latest_supplies_work_scope = bool(services)
     active_services = observations.get("active_services") or []
-    repeated_existing_scope = (
-        has_project
-        and latest_supplies_work_scope
-        and set(observations.get("possible_supported_services") or []).issubset(set(active_services))
-        and not re.search(r"\b(change|actually|make|update|instead|replace|switch|now|increase|decrease|remove|cancel|drop)\b", latest_message.lower())
-    )
+    repeated_existing_scope = has_project and latest_supplies_work_scope and set(services).issubset(set(active_services))
 
     if has_profile_detail and not hard_boundary_message and "upsert_customer_profile" not in names:
         errors.append("Customer supplied profile/contact/location details, so tool_actions must include upsert_customer_profile.")
+    if {"create_project", "add_project_job", "update_project_job", "upsert_indicative_estimate"} & names:
+        for service in services:
+            service_detail = (plan.get("service_details") or {}).get(service, {})
+            has_scope = bool(
+                isinstance(service_detail, dict)
+                and (service_detail.get("scope") or service_detail.get("scope_text") or service_detail.get("area_m2") or service_detail.get("estimated_area_m2"))
+            )
+            if not has_scope:
+                errors.append(f"Planner requested workflow actions for {service} but did not provide service_details.{service}.scope/scope_text/area.")
     if route == "hard_invariant" and not hard_boundary_message:
         errors.append("Do not use hard_invariant for ordinary booking-rule windows; use appointment_management with check_appointment_availability.")
     if "attach_job_media" in names and not has_project and "create_project" not in names:
         errors.append("attach_job_media requires an active project or create_project in the same planner action list.")
     if observations.get("pending_media") and (has_project or "create_project" in names) and "attach_job_media" not in names:
         errors.append("Pending customer media must be attached when a project exists or is created.")
-    if has_project and requested_service_removal(latest_message, active_services) and "remove_project_job" not in names:
-        errors.append("Clear removal of a named existing service must include remove_project_job.")
     if route in {"new_project", "existing_project", "appointment_management"} and services:
         has_job_scope_action = bool({"add_project_job", "update_project_job", "remove_project_job"} & names)
         has_complete_scope_actions = has_job_scope_action and "upsert_indicative_estimate" in names and "get_project_summary" in names
@@ -1218,6 +1048,7 @@ Output shape:
   "reply": "customer-facing reply you wrote",
   "tool_actions": [{{"name": "canonical_action", "reason": "why", "args": {{}}}}],
   "services": ["supported service keys"],
+  "excluded_services": ["supported service keys explicitly excluded or removed by customer"],
   "service_details": {{}},
   "postcode": null,
   "requested_window": null,
@@ -1231,13 +1062,14 @@ Output shape:
 Planning rules:
 - A plain greeting is identify_customer, tool_actions: [], no forced name/phone/address intake, warm lightweight opener.
 - FAQ and pure out_of_scope use tool_actions: [] and create no workflow records.
-- If the customer gives any name, phone, postcode, address, or corrected contact/location detail, request upsert_customer_profile with those changed fields. This includes postcode-only messages.
-- The backend does not parse customer names from raw text. When a customer gives a name, you must put that exact name in upsert_customer_profile.args.name.
+- The backend does not parse normal customer data from raw text. You must extract profile fields, service intent, service exclusions, service scope, and requested appointment windows from the customer message and conversation state.
+- If the customer gives any name, phone, postcode, address, or corrected contact/location detail, request upsert_customer_profile with those changed fields in tool_actions[].args. This includes postcode-only messages.
+- When a customer gives a name, put that exact name in upsert_customer_profile.args.name. When they give phone/postcode/address, put them in contact_phone/postcode/address_line.
 - If a supported work request has enough customer/location/service scope, request the complete project workflow actions in the same plan: create_project or update_project, add_project_job or update_project_job for every supported service, upsert_indicative_estimate, and get_project_summary.
 - A missing appointment window must not block project/job/indicative-estimate creation. Create the valid project records first, then ask naturally for dates/times in your reply and set appointment_required true.
 - If work intent exists but key details are missing, ask one natural follow-up and return tool_actions: [] for the missing workflow work.
 - Treat qualitative service scope as enough when the customer says small/medium/large lawn, few patches of weeding, hedge dimensions, planting shrubs, garden clearance waste/area, or garden design consultation.
-- If backend_observations_for_validation.explicitly_excluded_services contains a service, remove that service from services, service_details, missing_fields, and your reply. A clear correction such as "I don't need lawn mowing, just weeding" supersedes earlier pending state.
+- If a customer corrects or excludes a previously inferred service, put that service in excluded_services and remove it from services, service_details, missing_fields, and your reply. A clear correction such as "I don't need lawn mowing, just weeding" supersedes earlier pending state.
 - If a project exists and the customer asks status/summary, request get_project_summary.
 - Appointment creation/reschedule must request get_project_appointments, check_appointment_availability, and then create_appointment or update_appointment when the requested window is concrete.
 - If a customer gives a supported service and a concrete appointment window in the same message, request the project/job/estimate actions and the appointment sequence in the same plan.
@@ -1269,6 +1101,7 @@ Planning rules:
                 "appointment_mutation_must_include": ["get_project_appointments"],
                 "available_concrete_window_must_include": ["create_appointment or update_appointment"],
                 "new_project_with_supported_work_must_include": ["create_project", "add_project_job", "upsert_indicative_estimate", "get_project_summary"],
+                "workflow_actions_require_planner_extracted_scope": "If you request project/job/estimate actions, include concrete planner-extracted service_details for each service.",
                 "media_attachment_requires_project": "Do not request attach_job_media unless an active project exists or create_project is also requested.",
                 "pending_media_must_attach_when_project_ready": ["attach_job_media"],
                 "clear_existing_service_removal_must_include": ["remove_project_job"],
@@ -1283,6 +1116,7 @@ Planning rules:
                 "Include get_project_appointments before create_appointment, update_appointment, or cancel_appointment. "
                 "For available concrete appointment windows, include create_appointment for a new appointment or update_appointment for reschedule after check_appointment_availability. "
                 "If there is no existing project and the customer supplied supported work scope, also include create_project, add_project_job, upsert_indicative_estimate, and get_project_summary. "
+                "When you include create_project/add_project_job/upsert_indicative_estimate, populate service_details for every service from the customer message and conversation state; the backend will not parse scope from raw text. "
                 "Do not request attach_job_media unless an active project exists or create_project is also requested. "
                 "If pending media exists and a project exists or is created, include attach_job_media. "
                 "If the customer clearly asks to remove/cancel/drop an existing named service, include remove_project_job. "
@@ -1415,18 +1249,11 @@ async def handle_message(msg: TestMessage):
 
         customer, _ = await ensure_customer(con, msg)
         state = await con.fetchrow("select * from conversation_states where customer_id=$1 and conversation_id=$2", customer["id"], conversation_id)
-        known_postcode = find_postcode(msg.message) or await latest_postcode(con, customer["id"])
+        known_postcode = await latest_postcode(con, customer["id"])
         context = await latest_context(con, customer["id"], conversation_id)
 
         existing_details = state_json(state).get("service_details", {})
         inbound_media = normalized_media(msg, provider_message_id)
-        if media_intent(msg.message) and not inbound_media:
-            inbound_media.append({
-                "provider_media_id": provider_message_id + ":media",
-                "media_type": "image",
-                "source_message_id": provider_message_id,
-                "caption": redact(msg.message),
-            })
 
         observations = backend_observations(msg, state, context, existing_details, inbound_media)
         await record_tool_call(
@@ -1460,10 +1287,10 @@ async def handle_message(msg: TestMessage):
         route = plan["route"]
         planned_names = [a["name"] for a in plan["tool_actions"]]
         planned = set(planned_names)
-        excluded = set(observations.get("explicitly_excluded_services") or [])
+        excluded = set(plan.get("excluded_services") or [])
         prior_services = observations.get("state_services_after_exclusions") or []
-        services = [
-            service for service in list(dict.fromkeys(prior_services + plan["services"]))
+        services = list(plan["services"]) if plan["services"] else [
+            service for service in prior_services
             if service not in excluded
         ]
         if not services and context.get("jobs"):
@@ -1491,7 +1318,7 @@ async def handle_message(msg: TestMessage):
             if profile_action and isinstance(profile_action.get("args"), dict):
                 planner_profile_args.update(profile_action["args"])
             customer, changed_fields = await upsert_profile(con, msg, customer, conversation_id, provider_message_id, planner_profile_args)
-            known_postcode = find_postcode(msg.message) or await latest_postcode(con, customer["id"]) or known_postcode
+            known_postcode = await latest_postcode(con, customer["id"]) or known_postcode
             context = await latest_context(con, customer["id"], conversation_id)
 
         backend_missing = missing_for_project(customer, known_postcode, services, details) if route in {"new_project", "existing_project", "appointment_management"} else []
@@ -1572,7 +1399,7 @@ async def handle_message(msg: TestMessage):
             job_ids = [row["id"] for row in all_jobs]
 
         pending_media = details.get("__pending_media", []) if isinstance(details.get("__pending_media"), list) else []
-        if project and "attach_job_media" in planned and (inbound_media or media_intent(msg.message) or pending_media):
+        if project and "attach_job_media" in planned and (inbound_media or pending_media):
             media = pending_media[0] if pending_media else {"provider_media_id": provider_message_id + ":media", "media_type": "image", "source_message_id": provider_message_id, "caption": redact(msg.message)}
             mid = uuid.uuid4()
             await con.execute("insert into job_media_v4(id,project_id,job_id,media,source_message_id) values($1,$2,$3,$4::jsonb,$5)", mid, project["id"], job_ids[0] if job_ids else None, json.dumps(media), provider_message_id)
