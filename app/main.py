@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -1561,6 +1561,174 @@ async def staff_overview():
         }
 
 
+def metrics_window(range_key: str) -> tuple[str, datetime]:
+    windows = {
+        "24h": ("Last 24 hours", utcnow() - timedelta(hours=24)),
+        "3d": ("Last 3 days", utcnow() - timedelta(days=3)),
+        "7d": ("Last 7 days", utcnow() - timedelta(days=7)),
+        "30d": ("Last 30 days", utcnow() - timedelta(days=30)),
+    }
+    return windows.get(range_key, windows["7d"])
+
+
+def pct(part: int, whole: int) -> float:
+    return round((part / whole) * 100, 1) if whole else 0.0
+
+
+@app.get("/v1/staff/metrics")
+async def staff_metrics(range: str = Query(default="7d", pattern="^(24h|3d|7d|30d)$")):
+    label, since = metrics_window(range)
+    async with (await db()).acquire() as con:
+        inbound_messages = await con.fetchval(
+            "select count(*) from message_events where direction='inbound' and created_at >= $1",
+            since,
+        )
+        outbound_messages = await con.fetchval(
+            "select count(*) from message_events where direction='outbound' and created_at >= $1",
+            since,
+        )
+        chats = await con.fetchval(
+            "select count(distinct conversation_id) from message_events where conversation_id is not null and created_at >= $1",
+            since,
+        )
+        customers = await con.fetchval("select count(*) from customers where created_at >= $1", since)
+        projects = await con.fetchval("select count(*) from projects_v4 where created_at >= $1", since)
+        quotes = await con.fetchval("select count(*) from indicative_estimates_v4 where created_at >= $1", since)
+        appointments = await con.fetchval("select count(*) from appointments_v4 where created_at >= $1", since)
+        handoffs = await con.fetchval("select count(*) from handoff_cases where created_at >= $1", since)
+        tool_calls = await con.fetchval("select count(*) from tool_calls where created_at >= $1", since)
+        planner_events = await con.fetchval("select count(*) from planner_events where created_at >= $1", since)
+        appointment_status = rows(await con.fetch(
+            """
+            select lifecycle_state as label, count(*)::int as value
+            from appointments_v4
+            where created_at >= $1
+            group by lifecycle_state
+            order by count(*) desc, lifecycle_state
+            """,
+            since,
+        ))
+        quote_status = rows(await con.fetch(
+            """
+            select lifecycle_state as label, count(*)::int as value
+            from indicative_estimates_v4
+            where created_at >= $1
+            group by lifecycle_state
+            order by count(*) desc, lifecycle_state
+            """,
+            since,
+        ))
+        service_mix = rows(await con.fetch(
+            """
+            select service_key as label, count(*)::int as value
+            from jobs_v4
+            where created_at >= $1
+            group by service_key
+            order by count(*) desc, service_key
+            """,
+            since,
+        ))
+        route_mix = rows(await con.fetch(
+            """
+            select planner_output->>'route' as label, count(*)::int as value
+            from planner_events
+            where created_at >= $1 and planner_output ? 'route'
+            group by planner_output->>'route'
+            order by count(*) desc, label
+            """,
+            since,
+        ))
+        tool_mix = rows(await con.fetch(
+            """
+            select tool_name as label, count(*)::int as value
+            from tool_calls
+            where created_at >= $1
+            group by tool_name
+            order by count(*) desc, tool_name
+            limit 10
+            """,
+            since,
+        ))
+        daily_chats = rows(await con.fetch(
+            """
+            select date_trunc('day', created_at)::date::text as day, count(distinct conversation_id)::int as value
+            from message_events
+            where created_at >= $1 and conversation_id is not null
+            group by date_trunc('day', created_at)
+            """,
+            since,
+        ))
+        daily_projects = rows(await con.fetch(
+            """
+            select date_trunc('day', created_at)::date::text as day, count(*)::int as value
+            from projects_v4
+            where created_at >= $1
+            group by date_trunc('day', created_at)
+            """,
+            since,
+        ))
+        daily_quotes = rows(await con.fetch(
+            """
+            select date_trunc('day', created_at)::date::text as day, count(*)::int as value
+            from indicative_estimates_v4
+            where created_at >= $1
+            group by date_trunc('day', created_at)
+            """,
+            since,
+        ))
+        daily_appointments = rows(await con.fetch(
+            """
+            select date_trunc('day', created_at)::date::text as day, count(*)::int as value
+            from appointments_v4
+            where created_at >= $1
+            group by date_trunc('day', created_at)
+            """,
+            since,
+        ))
+    daily_map: dict[str, dict[str, Any]] = {}
+    for key, rows_ in (
+        ("chats", daily_chats),
+        ("projects", daily_projects),
+        ("quotes", daily_quotes),
+        ("appointments", daily_appointments),
+    ):
+        for item in rows_:
+            day = item["day"]
+            daily_map.setdefault(day, {"day": day, "chats": 0, "projects": 0, "quotes": 0, "appointments": 0})
+            daily_map[day][key] = item["value"]
+    daily = [daily_map[day] for day in sorted(daily_map)]
+    return {
+        "range": range,
+        "label": label,
+        "since": since.isoformat(),
+        "business_pack_version": BUSINESS_PACK_VERSION,
+        "totals": {
+            "chats": chats,
+            "inbound_messages": inbound_messages,
+            "outbound_messages": outbound_messages,
+            "customers": customers,
+            "projects": projects,
+            "quotes": quotes,
+            "appointments": appointments,
+            "handoffs": handoffs,
+            "tool_calls": tool_calls,
+            "planner_events": planner_events,
+        },
+        "rates": {
+            "quote_per_chat_pct": pct(quotes, chats),
+            "appointment_per_chat_pct": pct(appointments, chats),
+            "handoff_per_chat_pct": pct(handoffs, chats),
+            "project_per_chat_pct": pct(projects, chats),
+        },
+        "appointment_status": appointment_status,
+        "quote_status": quote_status,
+        "service_mix": service_mix,
+        "route_mix": route_mix,
+        "tool_mix": tool_mix,
+        "daily": daily,
+    }
+
+
 @app.get("/v1/staff/conversations/{conversation_id}")
 async def staff_conversation(conversation_id: str):
     async with (await db()).acquire() as con:
@@ -1626,8 +1794,8 @@ async def home_page():
 <style>
 :root{--ink:#17212b;--muted:#667085;--line:#d8dee6;--panel:#fff;--bg:#eef2f5;--green:#1f7a5c}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:linear-gradient(180deg,#f8fafb 0%,#eef2f5 100%);color:var(--ink)}
-.shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px}.home{width:min(1080px,100%);display:grid;gap:24px}.mast{display:grid;gap:10px}.kicker{font-size:13px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:.08em}.mast h1{font-size:44px;line-height:1.05;margin:0;letter-spacing:0}.mast p{max-width:720px;margin:0;color:var(--muted);font-size:17px;line-height:1.55}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.tile{display:grid;gap:18px;padding:22px;background:var(--panel);border:1px solid var(--line);border-radius:8px;text-decoration:none;color:inherit;box-shadow:0 18px 45px rgba(24,36,51,.08)}.tile strong{font-size:22px}.tile span{color:var(--muted);line-height:1.5}.cta{display:inline-flex;width:max-content;background:var(--ink);color:white;border-radius:6px;padding:10px 13px;font-weight:700}.meta{display:flex;gap:10px;flex-wrap:wrap}.pill{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:6px 9px;background:#fff;color:var(--muted)}
-@media(max-width:760px){.shell{align-items:start;padding:20px}.mast h1{font-size:34px}.grid{grid-template-columns:1fr}}
+.shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px}.home{width:min(1180px,100%);display:grid;gap:24px}.mast{display:grid;gap:10px}.kicker{font-size:13px;font-weight:700;color:var(--green);text-transform:uppercase;letter-spacing:.08em}.mast h1{font-size:44px;line-height:1.05;margin:0;letter-spacing:0}.mast p{max-width:720px;margin:0;color:var(--muted);font-size:17px;line-height:1.55}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.tile{display:grid;gap:18px;padding:22px;background:var(--panel);border:1px solid var(--line);border-radius:8px;text-decoration:none;color:inherit;box-shadow:0 18px 45px rgba(24,36,51,.08)}.tile strong{font-size:22px}.tile span{color:var(--muted);line-height:1.5}.cta{display:inline-flex;width:max-content;background:var(--ink);color:white;border-radius:6px;padding:10px 13px;font-weight:700}.meta{display:flex;gap:10px;flex-wrap:wrap}.pill{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:6px 9px;background:#fff;color:var(--muted)}
+@media(max-width:940px){.grid{grid-template-columns:1fr 1fr}}@media(max-width:760px){.shell{align-items:start;padding:20px}.mast h1{font-size:34px}.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -1650,6 +1818,12 @@ async def home_page():
         <strong>Staff dashboard</strong>
         <span>Review customer conversations, planner outputs, appointments, projects, and handoff cases.</span>
         <div class="cta">Open staff view</div>
+      </a>
+      <a class="tile" href="/metrics">
+        <div class="meta"><span class="pill">Quotes</span><span class="pill">Appointments</span><span class="pill">Trends</span></div>
+        <strong>Metrics</strong>
+        <span>Track chat volume, quote creation, appointment conversion, handoffs, and service demand by time period.</span>
+        <div class="cta">Open metrics</div>
       </a>
     </div>
   </section>
@@ -1680,7 +1854,7 @@ async def chat_page():
 <div class="app">
   <header class="top">
     <div class="brand"><div class="mark"></div><div><strong>Caerus Gardener Bot v4</strong><div class="idline">Chat tester</div></div></div>
-    <nav class="nav"><a href="/">Home</a><a href="/staff">Staff dashboard</a></nav>
+    <nav class="nav"><a href="/">Home</a><a href="/staff">Staff dashboard</a><a href="/metrics">Metrics</a></nav>
   </header>
   <main class="layout">
     <aside class="panel side">
@@ -1747,6 +1921,64 @@ newCustomer();loadCustomers();
     )
 
 
+@app.get("/metrics", response_class=HTMLResponse)
+async def metrics_page():
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Metrics - Caerus Gardener Bot</title>
+<style>
+:root{--bg:#f1f4f6;--panel:#fff;--ink:#18212b;--muted:#667085;--line:#d7dee8;--green:#20775d;--blue:#285a8e;--amber:#a96318;--red:#b42318}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}button{font:inherit;cursor:pointer}.top{min-height:68px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:12px 22px}.brand{display:flex;gap:12px;align-items:center}.mark{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--green))}.brand strong{font-size:17px}.muted{color:var(--muted)}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.refresh{padding:9px 12px;border-radius:6px;background:#f4f6f8;border:1px solid var(--line);text-decoration:none;color:var(--ink);font-weight:700}.refresh{border:1px solid var(--line)}.page{display:grid;gap:16px;padding:16px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.range{display:flex;gap:8px;flex-wrap:wrap}.range button{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:6px;padding:9px 12px;font-weight:750}.range button.active{background:var(--ink);border-color:var(--ink);color:#fff}.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.kpi{background:#fff;border:1px solid var(--line);border-radius:8px;padding:15px;display:grid;gap:7px}.kpi span{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:850}.kpi strong{font-size:30px;line-height:1}.kpi small{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.panel{background:#fff;border:1px solid var(--line);border-radius:8px;min-width:0;overflow:hidden}.panel h2{font-size:15px;margin:0;padding:14px 15px;border-bottom:1px solid var(--line)}.panel-body{padding:14px;display:grid;gap:12px}.bars{display:grid;gap:10px}.bar-row{display:grid;grid-template-columns:minmax(120px,210px) 1fr auto;gap:10px;align-items:center}.label{font-size:13px;color:#344054;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-track{height:10px;background:#eef2f6;border-radius:999px;overflow:hidden}.bar-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:999px;min-width:2px}.value{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}.rate-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}.rate{background:#fbfcfd;border:1px solid var(--line);border-radius:8px;padding:12px}.rate strong{display:block;font-size:22px}.rate span{display:block;color:var(--muted);font-size:12px;margin-top:4px}.timeline{display:grid;gap:8px}.day{display:grid;grid-template-columns:110px 1fr;gap:12px;align-items:center}.stacks{display:grid;grid-template-columns:repeat(4,1fr);gap:5px}.mini{height:34px;border-radius:6px;background:#f4f6f8;display:flex;align-items:center;justify-content:center;font-size:12px;color:#344054;font-weight:750}.empty{color:var(--muted);line-height:1.45}.wide{grid-column:1/-1}
+@media(max-width:980px){.kpis,.grid,.rate-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bar-row{grid-template-columns:1fr}.value{justify-self:start}.day{grid-template-columns:1fr}}@media(max-width:640px){.top{align-items:start;gap:12px;flex-direction:column}.kpis,.grid,.rate-grid{grid-template-columns:1fr}.nav{width:100%}.nav a,.refresh{flex:1;text-align:center}.toolbar{align-items:start}.range button{flex:1}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><div class="mark"></div><div><strong>Metrics</strong><div class="muted">Caerus Gardener Bot v4</div></div></div>
+  <nav class="nav"><a href="/">Home</a><a href="/chat">Chat tester</a><a href="/staff">Staff dashboard</a><button class="refresh" onclick="load()">Refresh</button></nav>
+</header>
+<main class="page">
+  <section class="toolbar">
+    <div><strong id="rangeTitle">Last 7 days</strong><div class="muted" id="sinceText">Loading...</div></div>
+    <div class="range" id="rangeButtons">
+      <button data-range="24h">24 hours</button>
+      <button data-range="3d">3 days</button>
+      <button data-range="7d">7 days</button>
+      <button data-range="30d">30 days</button>
+    </div>
+  </section>
+  <section class="kpis" id="kpis"></section>
+  <section class="panel wide"><h2>Conversion rates</h2><div class="panel-body"><div class="rate-grid" id="rates"></div></div></section>
+  <section class="grid">
+    <section class="panel"><h2>Service demand</h2><div class="panel-body"><div class="bars" id="serviceMix"></div></div></section>
+    <section class="panel"><h2>Planner routes</h2><div class="panel-body"><div class="bars" id="routeMix"></div></div></section>
+    <section class="panel"><h2>Top tool actions</h2><div class="panel-body"><div class="bars" id="toolMix"></div></div></section>
+    <section class="panel"><h2>Status mix</h2><div class="panel-body"><div class="bars" id="statusMix"></div></div></section>
+    <section class="panel wide"><h2>Daily activity</h2><div class="panel-body"><div class="timeline" id="daily"></div></div></section>
+  </section>
+</main>
+<script>
+let current='7d';
+const $=id=>document.getElementById(id);
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmt(n){return Number(n||0).toLocaleString();}
+function barRows(rows){if(!rows||!rows.length)return '<div class="empty">No data in this period.</div>';const max=Math.max(...rows.map(r=>Number(r.value||0)),1);return rows.map(r=>'<div class="bar-row"><div class="label">'+esc(r.label||'unknown')+'</div><div class="bar-track"><div class="bar-fill" style="width:'+Math.max(4,(Number(r.value||0)/max)*100)+'%"></div></div><div class="value">'+fmt(r.value)+'</div></div>').join('');}
+function render(data){$('rangeTitle').textContent=data.label;$('sinceText').textContent='Since '+new Date(data.since).toLocaleString();document.querySelectorAll('.range button').forEach(b=>b.classList.toggle('active',b.dataset.range===data.range));const t=data.totals||{};const kpis=[['Chats',t.chats,'Distinct conversations'],['Quotes',t.quotes,'Indicative estimates created'],['Appointments',t.appointments,'Consultations scheduled/proposed'],['Handoffs',t.handoffs,'Staff review cases'],['Projects',t.projects,'Project records created'],['Customers',t.customers,'New customer records'],['Messages',t.inbound_messages+t.outbound_messages,'Inbound + outbound'],['Planner events',t.planner_events,'LLM planner turns']];$('kpis').innerHTML=kpis.map(k=>'<div class="kpi"><span>'+esc(k[0])+'</span><strong>'+fmt(k[1])+'</strong><small>'+esc(k[2])+'</small></div>').join('');const r=data.rates||{};const rates=[['Quote / chat',r.quote_per_chat_pct],['Appointment / chat',r.appointment_per_chat_pct],['Project / chat',r.project_per_chat_pct],['Handoff / chat',r.handoff_per_chat_pct]];$('rates').innerHTML=rates.map(x=>'<div class="rate"><strong>'+esc(x[1])+'%</strong><span>'+esc(x[0])+'</span></div>').join('');$('serviceMix').innerHTML=barRows(data.service_mix);$('routeMix').innerHTML=barRows(data.route_mix);$('toolMix').innerHTML=barRows(data.tool_mix);$('statusMix').innerHTML=barRows([...(data.quote_status||[]).map(x=>({label:'Quote: '+x.label,value:x.value})),...(data.appointment_status||[]).map(x=>({label:'Appointment: '+x.label,value:x.value}))]);$('daily').innerHTML=(data.daily||[]).length?(data.daily||[]).map(d=>'<div class="day"><div class="label">'+esc(d.day)+'</div><div class="stacks"><div class="mini">Chats '+fmt(d.chats)+'</div><div class="mini">Projects '+fmt(d.projects)+'</div><div class="mini">Quotes '+fmt(d.quotes)+'</div><div class="mini">Appts '+fmt(d.appointments)+'</div></div></div>').join(''):'<div class="empty">No daily activity in this period.</div>';}
+async function load(){const r=await fetch('/v1/staff/metrics?range='+encodeURIComponent(current));render(await r.json());}
+document.querySelectorAll('.range button').forEach(b=>b.addEventListener('click',()=>{current=b.dataset.range;load();}));
+load();
+</script>
+</body>
+</html>
+        """
+    )
+
+
 @app.get("/staff", response_class=HTMLResponse)
 async def staff_page():
     return HTMLResponse(
@@ -1759,21 +1991,20 @@ async def staff_page():
 <title>Staff Dashboard - Caerus Gardener Bot</title>
 <style>
 :root{--bg:#f1f4f6;--panel:#fff;--ink:#18212b;--muted:#667085;--line:#d7dee8;--green:#20775d;--blue:#285a8e;--amber:#a96318}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}button{font:inherit;border:0;cursor:pointer}.top{min-height:68px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:12px 22px}.brand{display:flex;gap:12px;align-items:center}.mark{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--green))}.brand strong{font-size:17px}.nav{display:flex;gap:8px}.nav a,.refresh{padding:9px 12px;border-radius:6px;background:#f4f6f8;border:1px solid var(--line);text-decoration:none;color:var(--ink);font-weight:700}.page{display:grid;gap:16px;padding:16px}.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.stat{background:#fff;border:1px solid var(--line);border-radius:8px;padding:14px}.stat span{display:block;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:800}.stat strong{display:block;font-size:28px;margin-top:6px}.main{display:grid;grid-template-columns:360px minmax(0,1fr) 360px;gap:16px;align-items:start}.panel{background:#fff;border:1px solid var(--line);border-radius:8px;min-width:0;overflow:hidden}.panel h2{font-size:15px;margin:0;padding:14px 15px;border-bottom:1px solid var(--line)}.list{display:grid;max-height:calc(100vh - 220px);overflow:auto}.item{padding:12px 14px;border-bottom:1px solid var(--line);background:#fff;text-align:left}.item:hover{background:#f8fafb}.item strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.item small{display:block;color:var(--muted);margin-top:4px;line-height:1.35}.pill-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.pill{font-size:12px;border-radius:999px;padding:4px 8px;background:#f4f6f8;color:#344054}.pill.open{background:#fff1e3;color:#8a4b0f}.pill.urgent{background:#ffe7e4;color:#9f1f17}.detail{padding:14px;display:grid;gap:14px}.messages{display:grid;gap:9px}.bubble{max-width:86%;border-radius:8px;padding:10px 12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}.inbound{background:#d9fdd3;justify-self:end}.outbound{background:#eef2f6;justify-self:start}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{border:1px solid var(--line);border-radius:8px;padding:11px;background:#fbfcfd;min-width:0}.card strong{display:block;margin-bottom:5px}.muted{color:var(--muted)}.json{background:#111820;color:#d8f3dc;border-radius:8px;padding:12px;overflow:auto;font-size:12px;max-height:280px}.handoff{display:grid;gap:10px;padding:12px;border-bottom:1px solid var(--line)}.handoff-actions{display:flex;gap:8px}.handoff-actions button{border-radius:6px;padding:8px 10px;background:#f4f6f8;border:1px solid var(--line);font-weight:700}.empty{color:var(--muted);padding:14px;line-height:1.45}.tools{display:flex;flex-wrap:wrap;gap:6px}.tool{font-size:12px;background:#e8f1ff;color:#1d4f86;border-radius:999px;padding:4px 8px}
-@media(max-width:1180px){.stats{grid-template-columns:repeat(3,1fr)}.main{grid-template-columns:320px 1fr}.right{grid-column:1/3}}@media(max-width:760px){.top{align-items:start;gap:12px;flex-direction:column}.stats{grid-template-columns:repeat(2,1fr)}.main{grid-template-columns:1fr}.right{grid-column:auto}.list{max-height:none}.grid{grid-template-columns:1fr}.nav{width:100%}.nav a,.refresh{flex:1;text-align:center}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}button{font:inherit;border:0;cursor:pointer}.top{min-height:68px;background:#fff;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;padding:12px 22px}.brand{display:flex;gap:12px;align-items:center}.mark{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,var(--blue),var(--green))}.brand strong{font-size:17px}.nav{display:flex;gap:8px;flex-wrap:wrap}.nav a,.refresh{padding:9px 12px;border-radius:6px;background:#f4f6f8;border:1px solid var(--line);text-decoration:none;color:var(--ink);font-weight:700}.page{display:grid;gap:16px;padding:16px}.main{display:grid;grid-template-columns:340px minmax(620px,1fr);gap:16px;align-items:start}.panel{background:#fff;border:1px solid var(--line);border-radius:8px;min-width:0;overflow:hidden}.panel h2{font-size:15px;margin:0;padding:14px 15px;border-bottom:1px solid var(--line)}.subhead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 15px;border-bottom:1px solid var(--line);background:#fbfcfd}.subhead span{color:var(--muted);font-size:13px}.list{display:grid;max-height:calc(100vh - 150px);overflow:auto}.item{padding:12px 14px;border-bottom:1px solid var(--line);background:#fff;text-align:left}.item:hover{background:#f8fafb}.item strong{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.item small{display:block;color:var(--muted);margin-top:4px;line-height:1.35}.pill-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.pill{font-size:12px;border-radius:999px;padding:4px 8px;background:#f4f6f8;color:#344054}.pill.open{background:#fff1e3;color:#8a4b0f}.pill.urgent{background:#ffe7e4;color:#9f1f17}.detail{padding:16px;display:grid;gap:14px;min-width:0}.messages{display:grid;gap:10px;width:100%;min-width:0}.bubble{max-width:min(760px,76%);border-radius:8px;padding:10px 12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}.inbound{background:#d9fdd3;justify-self:end}.outbound{background:#eef2f6;justify-self:start}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{border:1px solid var(--line);border-radius:8px;padding:11px;background:#fbfcfd;min-width:0}.card strong{display:block;margin-bottom:5px}.muted{color:var(--muted)}.json{background:#111820;color:#d8f3dc;border-radius:8px;padding:12px;overflow:auto;font-size:12px;max-height:300px}.right{grid-column:1/-1}.handoff-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));max-height:280px;overflow:auto}.handoff{display:grid;gap:10px;padding:12px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.handoff-actions{display:flex;gap:8px}.handoff-actions button{border-radius:6px;padding:8px 10px;background:#f4f6f8;border:1px solid var(--line);font-weight:700}.empty{color:var(--muted);padding:14px;line-height:1.45}.tools{display:flex;flex-wrap:wrap;gap:6px}.tool{font-size:12px;background:#e8f1ff;color:#1d4f86;border-radius:999px;padding:4px 8px}
+@media(max-width:1180px){.main{grid-template-columns:300px minmax(0,1fr)}.handoff-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.bubble{max-width:86%}}@media(max-width:760px){.top{align-items:start;gap:12px;flex-direction:column}.main{grid-template-columns:1fr}.right{grid-column:auto}.list{max-height:none}.grid,.handoff-grid{grid-template-columns:1fr}.nav{width:100%}.nav a,.refresh{flex:1;text-align:center}.bubble{max-width:92%}}
 </style>
 </head>
 <body>
 <header class="top">
   <div class="brand"><div class="mark"></div><div><strong>Staff dashboard</strong><div class="muted">Caerus Gardener Bot v4</div></div></div>
-  <nav class="nav"><a href="/">Home</a><a href="/chat">Chat tester</a><button class="refresh" onclick="load()">Refresh</button></nav>
+  <nav class="nav"><a href="/">Home</a><a href="/chat">Chat tester</a><a href="/metrics">Metrics</a><button class="refresh" onclick="load()">Refresh</button></nav>
 </header>
 <main class="page">
-  <section class="stats" id="stats"></section>
   <section class="main">
     <aside class="panel"><h2>Conversation history</h2><div class="list" id="conversations"><div class="empty">Loading...</div></div></aside>
-    <section class="panel"><h2 id="detailTitle">Conversation detail</h2><div class="detail" id="detail"><div class="empty">Select a conversation to review chat history, planner events, and tool calls.</div></div></section>
-    <aside class="panel right"><h2>Staff handoffs</h2><div class="list" id="handoffs"></div></aside>
+    <section class="panel"><h2 id="detailTitle">Conversation detail</h2><div class="subhead"><span>Full chat transcript, latest route, tool calls, and planner output</span></div><div class="detail" id="detail"><div class="empty">Select a conversation to review chat history, planner events, and tool calls.</div></div></section>
+    <aside class="panel right"><h2>Staff handoffs</h2><div class="handoff-grid" id="handoffs"></div></aside>
   </section>
 </main>
 <script>
@@ -1783,9 +2014,9 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function fmtDate(v){if(!v)return'';try{return new Date(v).toLocaleString();}catch(e){return v;}}
 function count(name){return (overview?.[name]||[]).length}
 async function load(){const r=await fetch('/v1/staff/overview');overview=await r.json();renderStats();renderConversations();renderHandoffs();}
-function renderStats(){const stats=[['Customers',count('customers')],['Conversations',count('conversations')],['Projects',count('projects')],['Jobs',count('jobs')],['Appointments',count('appointments')],['Handoffs',count('handoffs')]];$('stats').innerHTML=stats.map(s=>'<div class="stat"><span>'+s[0]+'</span><strong>'+s[1]+'</strong></div>').join('');}
-function renderConversations(){const rows=overview.conversations||[];$('conversations').innerHTML=rows.length?rows.map(c=>'<button class="item" onclick="openConversation(\\''+esc(c.conversation_id)+'\\')"><strong>'+esc(c.conversation_id)+'</strong><small>'+esc((c.sender_ids||[]).join(', '))+'</small><small>'+esc(c.last_message||'')+'</small><div class="pill-row"><span class="pill">'+(c.message_count||0)+' messages</span><span class="pill">'+esc(fmtDate(c.last_at))+'</span></div></button>').join(''):'<div class="empty">No conversations yet.</div>';}
-function renderHandoffs(){const rows=overview.handoffs||[];$('handoffs').innerHTML=rows.length?rows.map(h=>'<div class="handoff"><div><strong>'+esc(h.reason)+'</strong><small class="muted">'+esc(h.safe_summary||'')+'</small></div><div class="pill-row"><span class="pill '+esc(h.status)+'">'+esc(h.status)+'</span><span class="pill '+esc(h.priority)+'">'+esc(h.priority)+'</span></div><div class="handoff-actions"><button onclick="patchHandoff(\\''+h.id+'\\',\\'in_progress\\')">In progress</button><button onclick="patchHandoff(\\''+h.id+'\\',\\'resolved\\')">Resolve</button></div></div>').join(''):'<div class="empty">No handoffs currently recorded.</div>';}
+function renderStats(){}
+function renderConversations(){const rows=overview.conversations||[];$('conversations').innerHTML=rows.length?rows.map(c=>'<button class="item" onclick="openConversation(&quot;'+esc(c.conversation_id)+'&quot;)"><strong>'+esc(c.conversation_id)+'</strong><small>'+esc((c.sender_ids||[]).join(', '))+'</small><small>'+esc(c.last_message||'')+'</small><div class="pill-row"><span class="pill">'+(c.message_count||0)+' messages</span><span class="pill">'+esc(fmtDate(c.last_at))+'</span></div></button>').join(''):'<div class="empty">No conversations yet.</div>';}
+function renderHandoffs(){const rows=overview.handoffs||[];$('handoffs').innerHTML=rows.length?rows.map(h=>'<div class="handoff"><div><strong>'+esc(h.reason)+'</strong><small class="muted">'+esc(h.safe_summary||'')+'</small></div><div class="pill-row"><span class="pill '+esc(h.status)+'">'+esc(h.status)+'</span><span class="pill '+esc(h.priority)+'">'+esc(h.priority)+'</span></div><div class="handoff-actions"><button onclick="patchHandoff(&quot;'+esc(h.id)+'&quot;,&quot;in_progress&quot;)">In progress</button><button onclick="patchHandoff(&quot;'+esc(h.id)+'&quot;,&quot;resolved&quot;)">Resolve</button></div></div>').join(''):'<div class="empty">No handoffs currently recorded.</div>';}
 async function patchHandoff(id,status){await fetch('/v1/staff/handoffs/'+id+'/status',{method:'PATCH',headers:{'content-type':'application/json'},body:JSON.stringify({status})});await load();}
 async function openConversation(id){$('detailTitle').textContent=id;const r=await fetch('/v1/staff/planner-traces/'+encodeURIComponent(id));const data=await r.json();const events=data.message_events||[];const planners=data.planner_events||[];const tools=data.tool_calls||[];const messages=events.map(e=>'<div class="bubble '+esc(e.direction)+'"><b>'+esc(e.direction)+'</b> - '+esc(fmtDate(e.created_at))+'\\n'+esc(e.body_redacted||'')+'</div>').join('')||'<div class="empty">No messages.</div>';const latest=planners[planners.length-1]?.planner_output||{};$('detail').innerHTML='<div class="messages">'+messages+'</div><div class="grid"><div class="card"><strong>Latest route</strong><span class="pill">'+esc(latest.route||'none')+'</span></div><div class="card"><strong>Business pack</strong><span class="muted">'+esc(latest.business_pack_version||overview.business_pack_version||'')+'</span></div></div><div class="card"><strong>Tool calls</strong><div class="tools">'+(tools.map(t=>'<span class="tool">'+esc(t.tool_name)+'</span>').join('')||'<span class="muted">None</span>')+'</div></div><div><strong>Latest planner output</strong><pre class="json">'+esc(JSON.stringify(latest,null,2))+'</pre></div>';}
 load();
