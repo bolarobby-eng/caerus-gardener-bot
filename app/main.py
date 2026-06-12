@@ -941,6 +941,7 @@ def planner_contract_errors(plan: dict[str, Any], context: dict[str, Any], obser
     services = plan.get("services") or []
     requested_window = plan.get("requested_window")
     has_window = isinstance(requested_window, dict) and requested_window.get("start") and requested_window.get("end")
+    reply = str(plan.get("reply") or "")
     latest_message = observations.get("latest_message", "")
     hard_boundary_message = is_high_risk(latest_message) or is_data_rights(latest_message) or wants_human(latest_message)
     has_location = bool(plan.get("postcode") or profile_updates.get("postcode") or profile_action_args.get("postcode") or context.get("project"))
@@ -960,6 +961,11 @@ def planner_contract_errors(plan: dict[str, Any], context: dict[str, Any], obser
             )
             if not has_scope:
                 errors.append(f"Planner requested workflow actions for {service} but did not provide service_details.{service}.scope/scope_text/area.")
+    if plan.get("appointment_required") and not has_window and {"create_project", "update_project", "add_project_job", "update_project_job", "upsert_indicative_estimate"} & names:
+        asks_now = re.search(r"\b(when|date|time|slot|available|availability|free|suit|weekday|saturday|morning|afternoon)\b", reply, re.I)
+        defers_question = re.search(r"\b(i'?ll|i will|we'?ll|we will)\s+ask\b.{0,40}\b(later|once|after|next)\b", reply, re.I)
+        if not asks_now or defers_question:
+            errors.append("When appointment_required is true after creating/scoping/estimating work, reply must ask for appointment availability now and must not promise to ask later.")
     if route == "hard_invariant" and not hard_boundary_message:
         errors.append("Do not use hard_invariant for ordinary booking-rule windows; use appointment_management with check_appointment_availability.")
     if "attach_job_media" in names and not has_project and "create_project" not in names:
@@ -1066,7 +1072,7 @@ Planning rules:
 - If the customer gives any name, phone, postcode, address, or corrected contact/location detail, request upsert_customer_profile with those changed fields in tool_actions[].args. This includes postcode-only messages.
 - When a customer gives a name, put that exact name in upsert_customer_profile.args.name. When they give phone/postcode/address, put them in contact_phone/postcode/address_line.
 - If a supported work request has enough customer/location/service scope, request the complete project workflow actions in the same plan: create_project or update_project, add_project_job or update_project_job for every supported service, upsert_indicative_estimate, and get_project_summary.
-- A missing appointment window must not block project/job/indicative-estimate creation. Create the valid project records first, then ask naturally for dates/times in your reply and set appointment_required true.
+- A missing appointment window must not block project/job/indicative-estimate creation. Create the valid project records first, then ask naturally for dates/times in the same reply and set appointment_required true. Do not say you will ask later; there is no automatic second follow-up message.
 - If work intent exists but key details are missing, ask one natural follow-up and return tool_actions: [] for the missing workflow work.
 - Treat qualitative service scope as enough when the customer says small/medium/large lawn, few patches of weeding, hedge dimensions, planting shrubs, garden clearance waste/area, or garden design consultation.
 - If a customer corrects or excludes a previously inferred service, put that service in excluded_services and remove it from services, service_details, missing_fields, and your reply. A clear correction such as "I don't need lawn mowing, just weeding" supersedes earlier pending state.
@@ -1102,6 +1108,7 @@ Planning rules:
                 "available_concrete_window_must_include": ["create_appointment or update_appointment"],
                 "new_project_with_supported_work_must_include": ["create_project", "add_project_job", "upsert_indicative_estimate", "get_project_summary"],
                 "workflow_actions_require_planner_extracted_scope": "If you request project/job/estimate actions, include concrete planner-extracted service_details for each service.",
+                "missing_appointment_window_requires_same_reply_question": "When appointment_required is true and no requested_window exists, the customer reply must ask for suitable dates/times now, not promise to ask later.",
                 "media_attachment_requires_project": "Do not request attach_job_media unless an active project exists or create_project is also requested.",
                 "pending_media_must_attach_when_project_ready": ["attach_job_media"],
                 "clear_existing_service_removal_must_include": ["remove_project_job"],
@@ -1117,6 +1124,7 @@ Planning rules:
                 "For available concrete appointment windows, include create_appointment for a new appointment or update_appointment for reschedule after check_appointment_availability. "
                 "If there is no existing project and the customer supplied supported work scope, also include create_project, add_project_job, upsert_indicative_estimate, and get_project_summary. "
                 "When you include create_project/add_project_job/upsert_indicative_estimate, populate service_details for every service from the customer message and conversation state; the backend will not parse scope from raw text. "
+                "If you create or update project/job/estimate records and no concrete requested_window exists, ask the customer for suitable appointment dates/times in this same reply; do not defer that question to a future automatic message. "
                 "Do not request attach_job_media unless an active project exists or create_project is also requested. "
                 "If pending media exists and a project exists or is created, include attach_job_media. "
                 "If the customer clearly asks to remove/cancel/drop an existing named service, include remove_project_job. "

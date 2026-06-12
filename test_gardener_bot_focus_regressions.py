@@ -83,6 +83,11 @@ def main():
         failures.append("lawn_mowing was created/updated after explicit customer exclusion")
     if not responses[3].get("project_id"):
         failures.append("project was not created once name, location, weeding service, and 10m x 10m scope were known")
+    scope_reply = responses[3].get("reply", "")
+    if not re.search(r"\b(when|date|time|slot|available|availability|free|suit|weekday|saturday|morning|afternoon)\b", scope_reply, re.I):
+        failures.append("scope-complete reply did not ask for appointment availability immediately")
+    if re.search(r"\b(i'?ll|i will|we'?ll|we will)\s+ask\b.{0,40}\b(later|once|after|next)\b", scope_reply, re.I):
+        failures.append("scope-complete reply deferred appointment question to a future automatic follow-up")
 
     latest_plan = tr.get("planner_events", [])[-1].get("planner_output", {})
     latest_services = latest_plan.get("services") or []
