@@ -521,6 +521,29 @@ def label_services(services: list[str]) -> str:
     return ", ".join(labels[:-1]) + " and " + labels[-1]
 
 
+def unsupported_lawn_scope_assumption(service_detail: dict[str, Any], latest_message: str) -> bool:
+    """Reject common invented lawn defaults while still allowing planner-owned extraction."""
+    latest = latest_message.lower()
+    size_value = str(service_detail.get("lawn_size") or service_detail.get("size") or "").lower()
+    condition_value = str(service_detail.get("lawn_condition") or service_detail.get("condition") or "").lower()
+    scope_text = str(service_detail.get("scope") or service_detail.get("scope_text") or "").lower()
+
+    size_terms = r"\b(small|medium|large|tiny|big|huge|m2|m²|metres?|meters?|sqm|square|x)\b"
+    condition_terms = r"\b(good|poor|bad|overgrown|long|short|patchy|condition)\b"
+    mentions_lawn_size = bool(re.search(size_terms, latest))
+    mentions_lawn_condition = bool(re.search(condition_terms, latest))
+
+    if size_value in {"small", "medium", "large"} and not mentions_lawn_size:
+        return True
+    if condition_value in {"good", "poor", "bad", "overgrown"} and not mentions_lawn_condition:
+        return True
+    if "medium-sized lawn" in scope_text and not mentions_lawn_size:
+        return True
+    if "good condition" in scope_text and not mentions_lawn_condition:
+        return True
+    return False
+
+
 def state_json(state: Optional[asyncpg.Record]) -> dict[str, Any]:
     if not state:
         return {}
@@ -1072,6 +1095,8 @@ def planner_contract_errors(plan: dict[str, Any], context: dict[str, Any], obser
             )
             if not has_scope:
                 errors.append(f"Planner requested workflow actions for {service} but did not provide service_details.{service}.scope/scope_text/area.")
+            if service == "lawn_mowing" and service not in active_services and unsupported_lawn_scope_assumption(service_detail, latest_message):
+                errors.append("Planner must not invent lawn size or condition for a newly added lawn_mowing service; ask for lawn size/condition before creating the job or estimate.")
     if plan.get("appointment_required") and not has_window and {"create_project", "update_project", "add_project_job", "update_project_job", "upsert_indicative_estimate"} & names:
         asks_now = re.search(r"\b(when|date|time|slot|available|availability|free|suit|weekday|saturday|morning|afternoon)\b", reply, re.I)
         defers_question = re.search(r"\b(i'?ll|i will|we'?ll|we will)\s+ask\b.{0,40}\b(later|once|after|next)\b", reply, re.I)
@@ -1194,6 +1219,7 @@ Planning rules:
 - A missing appointment window must not block project/job/indicative-estimate creation. Create the valid project records first, then ask naturally for dates/times in the same reply and set appointment_required true. Do not say you will ask later; there is no automatic second follow-up message.
 - If work intent exists but key details are missing, ask one natural follow-up and return tool_actions: [] for the missing workflow work.
 - Treat qualitative service scope as enough when the customer says small/medium/large lawn, few patches of weeding, hedge dimensions, planting shrubs, garden clearance waste/area, or garden design consultation.
+- Do not invent missing service details. If a customer adds lawn mowing to an existing project with wording like "also want the lawns done" but gives no lawn size, area, or condition, ask for those details and do not create/update the lawn_mowing job or estimate yet.
 - Treat dimensions such as "10m x 10m" as enough service scope. For weeding, convert dimensions to estimated_area_m2 where possible and include scope_text.
 - If a customer corrects or excludes a previously inferred service, put that service in excluded_services and remove it from services, service_details, missing_fields, and your reply. A clear correction such as "I don't need lawn mowing, just weeding" supersedes earlier pending state.
 - If a project exists and the customer asks status/summary, request get_project_summary.
@@ -1246,6 +1272,7 @@ Planning rules:
                 "For available concrete appointment windows, include create_appointment for a new appointment or update_appointment for reschedule after check_appointment_availability. "
                 "If there is no existing project and the customer supplied supported work scope, also include create_project, add_project_job, upsert_indicative_estimate, and get_project_summary. "
                 "When you include create_project/add_project_job/upsert_indicative_estimate, populate service_details for every service from the customer message and conversation state; the backend will not parse scope from raw text. "
+                "Do not invent lawn size or condition. If lawn_mowing is newly requested without size, area, or condition, remove workflow mutation actions and ask a concise follow-up. "
                 "If you create or update project/job/estimate records and no concrete requested_window exists, ask the customer for suitable appointment dates/times in this same reply; do not defer that question to a future automatic message. "
                 "Do not request attach_job_media unless an active project exists or create_project is also requested. "
                 "If pending media exists and a project exists or is created, include attach_job_media. "

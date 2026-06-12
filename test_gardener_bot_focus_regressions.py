@@ -123,7 +123,7 @@ def main():
     tr = traces(conv)
 
     blocked_reply = responses[4].get("reply", "")
-    if re.search(r"\b(works?\s+(well|for)|is\s+available|confirmed|booked|scheduled)\b", blocked_reply, re.I):
+    if re.search(r"\bsaturday\b.{0,30}\b(works?\s+(well|for)|is\s+available|confirmed|booked|scheduled)\b", blocked_reply, re.I):
         failures.append("blocked Saturday 4pm reply incorrectly implied the slot worked")
     if not re.search(r"\b(10:00|14:00|10am|2pm|weekday|alternative|instead|not available|outside|limited)\b", blocked_reply, re.I):
         failures.append("blocked Saturday 4pm reply did not explain valid alternatives")
@@ -139,8 +139,24 @@ def main():
         if expected not in final_names:
             failures.append(f"valid appointment turn did not execute {expected}")
 
+    lawn_response = post(sender, conv, "ok i also want to have my lawns done at the same time", 27)
+    tr = traces(conv)
+    lawn_actions = actions_for(tr, f"focus-{RUN}-27")
+    lawn_job_actions = [
+        call for call in lawn_actions
+        if call.get("tool_name") in {"add_project_job", "update_project_job"}
+        and call.get("arguments", {}).get("service_key") == "lawn_mowing"
+    ]
+    if lawn_job_actions:
+        failures.append("lawn_mowing job was created from invented lawn scope")
+    lawn_reply = lawn_response.get("reply", "")
+    if re.search(r"\bmedium-sized\b|\bgood condition\b", lawn_reply, re.I):
+        failures.append("lawn_mowing reply invented medium/good-condition scope")
+    if not re.search(r"\b(size|area|condition|how big|small|medium|large|m2|m²)\b", lawn_reply, re.I):
+        failures.append("lawn_mowing reply did not ask for missing lawn scope")
+
     fail("Focused v4 regressions", failures)
-    print(json.dumps({"ok": True, "case_count": 2, "conversation_ids": [f"focus-robert-{RUN}-conv", conv]}, indent=2))
+    print(json.dumps({"ok": True, "case_count": 3, "conversation_ids": [f"focus-robert-{RUN}-conv", conv]}, indent=2))
 
 
 if __name__ == "__main__":
